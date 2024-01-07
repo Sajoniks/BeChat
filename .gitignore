@@ -1,0 +1,7 @@
+*.user
+.idea
+_ReSharper.Caches
+bin
+obj
+serverProperties.json
+clientProperties.json
