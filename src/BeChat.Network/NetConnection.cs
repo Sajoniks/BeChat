@@ -1,9 +1,10 @@
 ﻿using System.Buffers;
 using System.Buffers.Binary;
 using System.Diagnostics;
+using System.IO.Hashing;
 using System.Net;
 using System.Net.Sockets;
-using System.Runtime.InteropServices;
+using System.Timers;
 
 namespace BeChat.Network;
 
@@ -14,14 +15,12 @@ namespace BeChat.Network;
 /// </summary>
 public sealed class NetConnection : IDisposable
 {
-    private readonly uint _protocolId;
-    private readonly Socket _socket;
-    private EndPoint? _remoteEp;
+    enum PacketType
+    {
+        Seq,
+        Ack
+    }
 
-    public EndPoint? LocalEndPoint => _socket.LocalEndPoint;
-    public EndPoint? RemoteEndPoint => _remoteEp;
-    public Socket Socket => _socket;
-    
     struct Header
     {
         public Header() { }
@@ -37,12 +36,16 @@ public sealed class NetConnection : IDisposable
             }
             
             ProtocolId = BinaryPrimitives.ReadUInt32BigEndian(b);
-            PacketId = BinaryPrimitives.ReadUInt32BigEndian(b.Slice(4));
-            Ack = BinaryPrimitives.ReadUInt32BigEndian(b.Slice(8));
+            PacketType = (PacketType)BinaryPrimitives.ReadUInt32BigEndian(b.Slice(4));
+            Checksum   = BinaryPrimitives.ReadUInt32BigEndian(b.Slice(8));
+            PacketId   = BinaryPrimitives.ReadUInt32BigEndian(b.Slice(12));
+            Ack        = BinaryPrimitives.ReadUInt32BigEndian(b.Slice(16));
         }
         
         public uint ProtocolId { get; set; } = 0;
         public uint PacketId { get; set; } = 0;
+        public PacketType PacketType { get; set; } = 0;
+        public uint Checksum { get; set; } = 0;
         public uint Ack { get; set; } = 0;
 
         /// <summary>
@@ -55,40 +58,188 @@ public sealed class NetConnection : IDisposable
             BinaryPrimitives.WriteUInt32BigEndian(buffer, ProtocolId);
             s.Write(buffer);
             
+            BinaryPrimitives.WriteUInt32BigEndian(buffer, (uint) PacketType);
+            s.Write(buffer);
+            
+            BinaryPrimitives.WriteUInt32BigEndian(buffer, Checksum);
+            s.Write(buffer);
+            
             BinaryPrimitives.WriteUInt32BigEndian(buffer, PacketId);
             s.Write(buffer);
             
             BinaryPrimitives.WriteUInt32BigEndian(buffer, Ack);
             s.Write(buffer);
         }
-    }
-
-    private uint _packetsSent;
-    private long _lastRecvPacketTime;
-    private uint _mostRecentPacket;
-    
-    private bool _disposed;
-
-    private enum PacketHeaderFields
-    {
-        ProtocolId = sizeof(uint),
-        PacketNum = sizeof(uint),
-        Ack = sizeof(uint),
         
-        HeaderSize = ProtocolId + PacketNum + Ack
+        public enum PacketHeaderFields
+        {
+            ProtocolId = sizeof(uint),
+            PacketType = sizeof(uint),
+            Checksum = sizeof(uint),
+            PacketNum = sizeof(uint),
+            Ack = sizeof(uint),
+        
+            HeaderSize = ProtocolId + PacketType + Checksum + PacketNum + Ack
+        }
+
+        public static int HeaderSize => (int) PacketHeaderFields.HeaderSize;
+    }
+    record BufferedPacket(ArraySegment<byte> Data, Header Header);
+
+    private sealed class Window
+    {
+        public enum State
+        {
+            Blocked,
+            Up
+        }
+
+        public enum Mode
+        {
+            Receiver,
+            Sender
+        }
+        
+        private readonly int _windowSize;
+        
+        private State _state = State.Up;
+        private Mode _mode;
+
+        private uint _nextPacket = 0;
+        private uint _base = 0;
+
+        private SortedSet<uint> _packetReceivedAcks = new();
+        private SortedSet<uint> _packetsWaitingAck = new();
+        private Queue<uint> _availablePackets = new();
+
+        public uint NextPacketId => _nextPacket;
+        public uint BasePacketId => _base;
+
+        public bool IsEmpty => !_packetsWaitingAck.Any();
+        public bool IsReady => _state == State.Up;
+        public bool IsBlocked => _state == State.Blocked;
+        public Queue<uint> AvailablePackets => _availablePackets;
+        public IReadOnlySet<uint> OutstandingPackets => _packetsWaitingAck;
+
+        public Window(Mode mode, int windowSize)
+        {
+            _windowSize = windowSize;
+            _mode = mode;
+        }
+
+        public bool IsInWindow(uint packetId)
+        {
+            return packetId >= _base && packetId < _base + _windowSize;
+        }
+
+        public void Push()
+        {
+            if (_mode != Mode.Sender)
+            {
+                throw new NotSupportedException();
+            }
+            
+            if ((_nextPacket - _base + 1) >= _windowSize)
+            {
+                _state = State.Blocked;
+            }
+
+            _packetsWaitingAck.Add(_nextPacket);
+            _nextPacket++;
+        }
+
+        public int Put(uint packetId)
+        {
+            if (packetId < _base || packetId >= (_base + _windowSize))
+            {
+                return 0;
+            }
+            
+            if (_packetReceivedAcks.Add(packetId))
+            {
+                _packetsWaitingAck.Remove(packetId);
+                
+                if (_base == packetId)
+                {
+                    // shift window 
+
+                    int shifted = 0;
+                    while (_packetReceivedAcks.Any() && _packetReceivedAcks.First() == _base)
+                    {
+                        uint curPktId = _packetReceivedAcks.First();
+                        ++_base;
+                        ++shifted;
+                        
+                        _availablePackets.Enqueue(curPktId);
+                        _packetReceivedAcks.Remove(curPktId);
+                    }
+
+                    return shifted;
+                }
+            }
+
+            return 0;
+        }
     }
     
+    private readonly uint _protocolId;
+    private readonly Socket _socket;
+    private EndPoint? _remoteEp;
+
+    private bool _connected = false;
+    public bool Connected => _connected;
+    public EndPoint? LocalEndPoint => _socket.LocalEndPoint;
+    public EndPoint? RemoteEndPoint => _remoteEp;
+    public Socket Socket => _socket;
+    
+    private readonly int _windowSize = 5;
+    private readonly System.Timers.Timer _ackTimer;
+    private readonly Window _sendWindow;
+    private readonly Window _recvWindow;
+
+    private readonly Dictionary<uint, BufferedPacket> _bufferedInPackets = new();
+    private readonly Dictionary<uint, BufferedPacket> _bufferdOutPackets = new();
+    
+    
+    private readonly byte[] _recvBuffer = new byte[16 * 1024 * 1024];
+    private int _recvPos = 0;
+    private readonly byte[] _sendBuffer = new byte[16 * 1024 * 1024];
+    private int _sendPos = 0;
+    
+    private bool _disposed = false;
+    private volatile bool _timeout = false;
+
+
     public NetConnection(uint protocolId)
     {
         _protocolId = protocolId;
-        _disposed = false;
-        _packetsSent = 0;
-        _mostRecentPacket = 0;
-        _socket = new Socket(SocketType.Dgram, ProtocolType.Udp);
+
+        _sendWindow = new Window(Window.Mode.Sender, _windowSize);
+        _recvWindow = new Window(Window.Mode.Receiver, _windowSize);
+        
+        _ackTimer = new System.Timers.Timer();
+        _ackTimer.Elapsed += AckTimerTimeout;
+        _ackTimer.Interval = 1000;
+        
+        _socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
     }
 
-    public void Bind(IPEndPoint endPoint)
+    private void AckTimerTimeout(object? source, ElapsedEventArgs args)
     {
+        if (_remoteEp is null)
+        {
+            throw new SocketException();
+        }
+
+        _timeout = true;
+    }
+
+    public void Bind(IPEndPoint endPoint, bool reuseSocket = false)
+    {
+        if (reuseSocket)
+        {
+            _socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+        }
         _socket.Bind(endPoint);
     }
 
@@ -104,42 +255,58 @@ public sealed class NetConnection : IDisposable
         bool connected = false;
         Stopwatch sendClock = new Stopwatch();
         Stopwatch recvClock = new Stopwatch();
-        
+
         try
         {
             _socket.SendTo(outgoingPacket, 5, SocketFlags.None, endPoint);
-            recvClock.Start();
-            
+            sendClock.Start();
+
             while (true)
             {
-                if (!connected && _socket.Poll(100 * 1500, SelectMode.SelectRead))
+                try
                 {
-                    int recv = _socket.ReceiveFrom(incomingPacket, ref ep);
-                    if (ep.Equals(endPoint) && recv == 5)
+                    if (!connected && _socket.Poll(150, SelectMode.SelectRead))
                     {
-                        uint recvProtocolId = BinaryPrimitives.ReadUInt32BigEndian(incomingPacket);
-                        if (recvProtocolId == _protocolId)
+                        int recv = _socket.ReceiveFrom(incomingPacket, ref ep);
+                        var ipEp = ep as IPEndPoint ?? throw new InvalidProgramException();
+
+                        if (ipEp.Port.Equals(endPoint.Port) && recv == 5)
                         {
-                            _remoteEp = ep;
-                            connected = true;
-                            recvClock.Start();
-                            
-                            // connection established
-                            // keep sending packets for next n seconds to ensure that remote side will connect too
+                            uint recvProtocolId = BinaryPrimitives.ReadUInt32BigEndian(incomingPacket);
+                            if (recvProtocolId == _protocolId)
+                            {
+                                _remoteEp = ep;
+                                connected = true;
+                                recvClock.Start();
+
+                                // connection established
+                                // keep sending packets for next n seconds to ensure that remote side will connect too
+                            }
                         }
                     }
                 }
-                else if (connected && recvClock.ElapsedMilliseconds >= 1000)
+                catch (SocketException)
                 {
+                    // ignored
+                }
+
+
+                if (connected && recvClock.ElapsedMilliseconds >= 500)
+                {
+                    _connected = true;
                     break;
                 }
 
-                if (sendClock.ElapsedMilliseconds >= 1500)
+                if (sendClock.ElapsedMilliseconds >= 100)
                 {
                     sendClock.Restart();
                     _socket.SendTo(outgoingPacket, 5, SocketFlags.None, endPoint);
                 }
             }
+        }
+        catch (Exception)
+        {
+            // Failure
         }
         finally
         {
@@ -148,80 +315,201 @@ public sealed class NetConnection : IDisposable
         }
     }
 
-    public int Receive(Span<byte> buffer)
+    public int Receive(byte[] buffer)
     {
         if (_remoteEp is null)
         {
             throw new SocketException();
         }
 
-        byte[] packetBuffer = Array.Empty<byte>();
-        try
+        byte[] peek = new byte[1];
+        while (true)
         {
-            int headerSize = (int)PacketHeaderFields.HeaderSize;
-            int packetLength = buffer.Length + headerSize;
-            packetBuffer = ArrayPool<byte>.Shared.Rent(packetLength);
-            EndPoint ep = new IPEndPoint(IPAddress.Any, 0);
-            do
+            if (_timeout)
             {
-                int recv = _socket.ReceiveFrom(packetBuffer, packetLength, SocketFlags.None, ref ep);
-                if (recv >= headerSize)
+                foreach (var outstandingPacketId in _sendWindow.OutstandingPackets)
                 {
-                    Header header = new Header(packetBuffer.AsSpan(0, headerSize));
-                    if (header.ProtocolId == _protocolId)
-                    {
-                        _lastRecvPacketTime = (long) DateTime.UtcNow.Ticks / TimeSpan.TicksPerMillisecond;
-                        if (header.PacketId > _mostRecentPacket)
-                        {
-                            _mostRecentPacket = header.PacketId;
-                        }
+                    BufferedPacket outstandingPacket = _bufferdOutPackets[outstandingPacketId];
+                    byte[] curPktData = outstandingPacket.Data.Array!;
+                    _socket.SendTo(curPktData, outstandingPacket.Data.Offset, outstandingPacket.Data.Count, SocketFlags.None, _remoteEp);
+            
+                    // Console.WriteLine($"[{Thread.CurrentThread.Name}] Sent packet {outstandingPacketId} to {_remoteEp} because of timeout");
+                }
+                _timeout = false;
+                _ackTimer.Stop();
+                _ackTimer.Start();
+            }
+            
+            if (!_socket.Poll(150, SelectMode.SelectRead))
+            {
+                continue;
+            }
 
-                        int contentLength = recv - headerSize;
-                        packetBuffer.AsSpan(headerSize, contentLength).CopyTo(buffer);
-                        return contentLength;
+            EndPoint ep = new IPEndPoint(IPAddress.Any, 0);
+            int recvBytes = _socket.ReceiveFrom(_recvBuffer, _recvPos, _recvBuffer.Length - _recvPos, SocketFlags.None, ref ep);
+            int totalRecvBytes = 0;
+            
+            if (recvBytes >= Header.HeaderSize && ep.Equals(_remoteEp))
+            {
+                var header = new Header(_recvBuffer.AsSpan(_recvPos, Header.HeaderSize));
+                
+                if (header.ProtocolId == _protocolId)
+                {
+                    int startRecvPos = _recvPos;
+                    _recvPos += recvBytes;
+                    
+                    switch (header.PacketType)
+                    {
+                        case PacketType.Seq:
+                        {
+                            if (_recvWindow.IsInWindow(header.PacketId))
+                            {
+                                // Console.WriteLine($"[{Thread.CurrentThread.Name}] Received {header.PacketType} {header.PacketId} {_remoteEp} => {LocalEndPoint}");
+                                
+                                var segment = new ArraySegment<byte>(_recvBuffer, startRecvPos, recvBytes);
+                                var bufferedPacket = new BufferedPacket(segment, header);
+                                _bufferedInPackets[header.PacketId] = bufferedPacket;
+                                
+                                int available = _recvWindow.Put(header.PacketId);
+                                if (available > 0)
+                                {
+                                    int writePos = 0;
+                                    while (_recvWindow.AvailablePackets.TryDequeue(out uint bufferedPacketId))
+                                    {
+                                        BufferedPacket curPkt = _bufferedInPackets[bufferedPacketId];
+                                        _bufferedInPackets.Remove(bufferedPacketId);
+                                        
+                                        var curPktData = curPkt.Data.Array!;
+                                        Array.Copy(curPktData, curPkt.Data.Offset + Header.HeaderSize, buffer, writePos, curPkt.Data.Count - Header.HeaderSize);
+                                        Array.Fill(_recvBuffer, Byte.MinValue, curPkt.Data.Offset, curPkt.Data.Count);
+
+                                        writePos += curPkt.Data.Count;
+                                    }
+
+                                    totalRecvBytes = writePos;
+                                    _recvPos -= totalRecvBytes;
+                                }
+                            }
+                            
+                            // send ack
+                            {
+                                var ackHeader = new Header
+                                {
+                                    ProtocolId = _protocolId,
+                                    Ack = header.PacketId,
+                                    PacketId = header.PacketId,
+                                    PacketType = PacketType.Ack
+                                };
+
+                                using var ackMemoryStream = new MemoryStream();
+                                ackHeader.WriteBytes(ackMemoryStream);
+
+                                _socket.SendTo(ackMemoryStream.ToArray(), Header.HeaderSize, SocketFlags.None, _remoteEp);
+                                
+                                // Console.WriteLine($"[{Thread.CurrentThread.Name}] Sent {ackHeader.PacketType} {ackHeader.PacketId} {LocalEndPoint} => {_remoteEp}");
+                            }
+                        }
+                        break;
+
+                        case PacketType.Ack:
+                        {
+                            if (_sendWindow.IsInWindow(header.Ack))
+                            {
+                                // Console.WriteLine($"[{Thread.CurrentThread.Name}] Ack {header.Ack} accepted {_remoteEp} => {LocalEndPoint}");
+
+                                int available = _sendWindow.Put(header.Ack);
+                                if (available > 0)
+                                {
+                                    while (_sendWindow.AvailablePackets.TryDequeue(out uint packetId))
+                                    {
+                                        BufferedPacket curPkt = _bufferdOutPackets[packetId];
+                                        _bufferdOutPackets.Remove(packetId);
+                                        
+                                        Array.Fill(_sendBuffer, Byte.MinValue, curPkt.Data.Offset, curPkt.Data.Count);
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                // Console.WriteLine($"[{Thread.CurrentThread.Name}] Ack {header.Ack} ignored {_remoteEp} => {LocalEndPoint}");
+                            }
+
+                            if (_sendWindow.IsEmpty)
+                            {
+                                _ackTimer.Stop();
+                            }
+                        } 
+                        break;
                     }
                 }
-                
-            } while (true);
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(packetBuffer);
+                else
+                {
+                    Array.Fill(_recvBuffer, Byte.MinValue, _recvPos, recvBytes);
+                }
+
+                if (totalRecvBytes > 0)
+                {
+                    return totalRecvBytes;
+                }
+            }
         }
     }
 
-    public void Send(ReadOnlySpan<byte> buffer)
+    public int Send(ReadOnlySpan<byte> buffer)
     {
         if (_remoteEp is null)
         {
             throw new SocketException();
         }
 
-        byte[] packetBuffer = Array.Empty<byte>();
-        try
+        int packetTotalSize = Header.HeaderSize + buffer.Length;
+        if (packetTotalSize > _sendBuffer.Length)
         {
-            int packetLength = buffer.Length + (int)PacketHeaderFields.HeaderSize;
-            packetBuffer = ArrayPool<byte>.Shared.Rent(packetLength);
-            
-            Header header = new Header
-            {
-                ProtocolId = _protocolId,
-                PacketId = _packetsSent,
-                Ack = _mostRecentPacket,
-            };
+            throw new OverflowException();
+        }
 
-            using var stream = new MemoryStream(packetBuffer);
-            
-            header.WriteBytes(stream);
-            stream.Write(buffer);
-            
-            _socket.SendTo(packetBuffer, packetLength, SocketFlags.None, _remoteEp);
-            ++_packetsSent;
-        }
-        finally
+        int send = 0;
+        var header = new Header
         {
-            ArrayPool<byte>.Shared.Return(packetBuffer);
+            ProtocolId = _protocolId,
+            PacketType = PacketType.Seq,
+            PacketId = _sendWindow.NextPacketId
+        };
+
+        using var memoryStream = new MemoryStream(_sendBuffer, _sendPos, packetTotalSize);
+        header.WriteBytes(memoryStream);
+        memoryStream.Write(buffer);
+        int lastSendPos = _sendPos;
+        
+        if (!_sendWindow.IsBlocked)
+        {
+            send = _socket.SendTo(_sendBuffer, _sendPos, packetTotalSize, SocketFlags.None, _remoteEp);
+            if (send > 0)
+            {
+                _sendWindow.Push();
+                _sendPos += packetTotalSize;
+                
+                // Console.WriteLine($"[{Thread.CurrentThread.Name}] Send {header.PacketType} {header.PacketId} {LocalEndPoint} => {_remoteEp}");
+
+                // reset ack timer
+                _ackTimer.Stop();
+                _ackTimer.Start();
+            }
+            else
+            {
+                Array.Fill(_sendBuffer, Byte.MinValue, _sendPos, packetTotalSize);
+            }
         }
+
+        if (send > 0)
+        {
+            // buffer it
+            var segment = new ArraySegment<byte>(_sendBuffer, lastSendPos, packetTotalSize);
+            var bufferedPacket = new BufferedPacket(segment, header);
+            _bufferdOutPackets[header.PacketId] = bufferedPacket;
+        }
+
+        return send;
     }
 
     public void Dispose()
