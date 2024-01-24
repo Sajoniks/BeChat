@@ -7,7 +7,12 @@
     </PropertyGroup>
 
     <ItemGroup>
+      <PackageReference Include="NSec.Cryptography" Version="22.4.0" />
       <PackageReference Include="System.IO.Hashing" Version="8.0.0" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <Folder Include="Security" />
     </ItemGroup>
 
 </Project>

@@ -5,6 +5,7 @@ using System.IO.Hashing;
 using System.Net;
 using System.Net.Sockets;
 using System.Timers;
+using NSec.Cryptography;
 
 namespace BeChat.Network;
 
@@ -18,6 +19,8 @@ public sealed class NetConnection : IDisposable
     enum PacketType
     {
         Seq,
+        Enk,
+        EnkAck,
         Ack
     }
 
@@ -209,11 +212,15 @@ public sealed class NetConnection : IDisposable
     private bool _disposed = false;
     private volatile bool _timeout = false;
 
+    private bool _sendEncryption = false;
+    private Key? _key;
+    private SharedSecret? _secret;
+
 
     public NetConnection(uint protocolId)
     {
         _protocolId = protocolId;
-
+        
         _sendWindow = new Window(Window.Mode.Sender, _windowSize);
         _recvWindow = new Window(Window.Mode.Receiver, _windowSize);
         
@@ -245,8 +252,8 @@ public sealed class NetConnection : IDisposable
 
     public void Connect(IPEndPoint endPoint)
     {
-        byte[] outgoingPacket = ArrayPool<byte>.Shared.Rent(5);
-        byte[] incomingPacket = ArrayPool<byte>.Shared.Rent(5);
+        byte[] outgoingPacket = ArrayPool<byte>.Shared.Rent(128);
+        byte[] incomingPacket = ArrayPool<byte>.Shared.Rent(128);
         BinaryPrimitives.WriteUInt32BigEndian(outgoingPacket, _protocolId);
 
         EndPoint ep = new IPEndPoint(IPAddress.Any, 0);
@@ -254,14 +261,13 @@ public sealed class NetConnection : IDisposable
 
         bool connected = false;
         Stopwatch sendClock = new Stopwatch();
-        Stopwatch recvClock = new Stopwatch();
 
         try
         {
-            _socket.SendTo(outgoingPacket, 5, SocketFlags.None, endPoint);
+            _socket.SendTo(outgoingPacket, 4, SocketFlags.None, endPoint);
             sendClock.Start();
 
-            while (true)
+            while (!_connected)
             {
                 try
                 {
@@ -270,17 +276,68 @@ public sealed class NetConnection : IDisposable
                         int recv = _socket.ReceiveFrom(incomingPacket, ref ep);
                         var ipEp = ep as IPEndPoint ?? throw new InvalidProgramException();
 
-                        if (ipEp.Port.Equals(endPoint.Port) && recv == 5)
+                        if (ipEp.Port.Equals(endPoint.Port) && recv == 4 && !_sendEncryption)
                         {
                             uint recvProtocolId = BinaryPrimitives.ReadUInt32BigEndian(incomingPacket);
                             if (recvProtocolId == _protocolId)
                             {
                                 _remoteEp = ep;
-                                connected = true;
-                                recvClock.Start();
+                                _key = new Key(KeyAgreementAlgorithm.X25519);
 
-                                // connection established
-                                // keep sending packets for next n seconds to ensure that remote side will connect too
+                                var header = new Header
+                                {
+                                    PacketType = PacketType.Enk,
+                                    ProtocolId = _protocolId
+                                };
+                                
+                                using var memoryStream = new MemoryStream();
+                                header.WriteBytes(memoryStream);
+                                var data = _key.Export(KeyBlobFormat.RawPublicKey);
+                                memoryStream.Write(BitConverter.GetBytes(IPAddress.HostToNetworkOrder(data.Length)));
+                                memoryStream.Write(data);
+
+                                _socket.SendTo(memoryStream.ToArray(), _remoteEp);
+                                _sendEncryption = true;
+                            }
+                        }
+                        else if (_sendEncryption && _remoteEp is not null && _remoteEp.Equals(ipEp) && recv >= Header.HeaderSize)
+                        {
+                            var header = new Header(incomingPacket.AsSpan(0, Header.HeaderSize));
+                            switch (header.PacketType)
+                            {
+                                case PacketType.Enk:
+                                {
+                                    using (var stream = new MemoryStream(incomingPacket, Header.HeaderSize, recv - Header.HeaderSize))
+                                    using (var reader = new BinaryReader(stream))
+                                    {
+                                        int dataLen = IPAddress.NetworkToHostOrder(reader.ReadInt32());
+                                        var data = reader.ReadBytes(dataLen);
+
+                                        _secret = KeyAgreementAlgorithm.X25519.Agree(_key,
+                                            PublicKey.Import(KeyAgreementAlgorithm.X25519, data,
+                                                KeyBlobFormat.RawPublicKey));
+                                    }
+                                    
+                                    // send ack
+                                    using (var stream = new MemoryStream())
+                                    {
+                                        var ackHeader = new Header
+                                        {
+                                            ProtocolId = _protocolId,
+                                            PacketType = PacketType.EnkAck
+                                        };
+                                        ackHeader.WriteBytes(stream);
+                                        _socket.SendTo(stream.ToArray(), _remoteEp);
+                                    }
+                                }
+                                break;
+
+                                case PacketType.EnkAck:
+                                {
+                                    // we are ready 
+                                    _connected = true;
+                                }
+                                break;
                             }
                         }
                     }
@@ -290,13 +347,7 @@ public sealed class NetConnection : IDisposable
                     // ignored
                 }
 
-
-                if (connected && recvClock.ElapsedMilliseconds >= 500)
-                {
-                    _connected = true;
-                    break;
-                }
-
+                
                 if (sendClock.ElapsedMilliseconds >= 100)
                 {
                     sendClock.Restart();
@@ -373,21 +424,28 @@ public sealed class NetConnection : IDisposable
                                 int available = _recvWindow.Put(header.PacketId);
                                 if (available > 0)
                                 {
+                                    using var key = KeyDerivationAlgorithm.HkdfSha256.DeriveKey(_secret, ReadOnlySpan<byte>.Empty, 
+                                        new byte[12], AeadAlgorithm.Aes256Gcm);
+                                    
                                     int writePos = 0;
+                                    int realWritePos = 0;
                                     while (_recvWindow.AvailablePackets.TryDequeue(out uint bufferedPacketId))
                                     {
                                         BufferedPacket curPkt = _bufferedInPackets[bufferedPacketId];
                                         _bufferedInPackets.Remove(bufferedPacketId);
                                         
                                         var curPktData = curPkt.Data.Array!;
-                                        Array.Copy(curPktData, curPkt.Data.Offset + Header.HeaderSize, buffer, writePos, curPkt.Data.Count - Header.HeaderSize);
+                                        var content = AeadAlgorithm.Aes256Gcm.Decrypt(key, new byte[12], new byte[12], curPktData.AsSpan(Header.HeaderSize, curPkt.Data.Count - Header.HeaderSize));
+
+                                        Array.Copy(content, 0, buffer, writePos, content.Length);
                                         Array.Fill(_recvBuffer, Byte.MinValue, curPkt.Data.Offset, curPkt.Data.Count);
 
-                                        writePos += curPkt.Data.Count;
+                                        writePos += content.Length;
+                                        realWritePos += curPkt.Data.Count;
                                     }
 
                                     totalRecvBytes = writePos;
-                                    _recvPos -= totalRecvBytes;
+                                    _recvPos -= realWritePos;
                                 }
                             }
                             
@@ -476,18 +534,26 @@ public sealed class NetConnection : IDisposable
             PacketId = _sendWindow.NextPacketId
         };
 
-        using var memoryStream = new MemoryStream(_sendBuffer, _sendPos, packetTotalSize);
+        using var memoryStream = new MemoryStream(_sendBuffer, _sendPos, _sendBuffer.Length - _sendPos);
         header.WriteBytes(memoryStream);
-        memoryStream.Write(buffer);
+
+        using var key = KeyDerivationAlgorithm.HkdfSha256.DeriveKey(_secret, ReadOnlySpan<byte>.Empty, new byte[12],
+            AeadAlgorithm.Aes256Gcm);
+
+        var content = AeadAlgorithm.Aes256Gcm.Encrypt(key, new byte[12], new byte[12], buffer);
+        memoryStream.Write(content);
+        
+        
         int lastSendPos = _sendPos;
+        int realPacketSize = content.Length + Header.HeaderSize;
         
         if (!_sendWindow.IsBlocked)
         {
-            send = _socket.SendTo(_sendBuffer, _sendPos, packetTotalSize, SocketFlags.None, _remoteEp);
+            send = _socket.SendTo(_sendBuffer, _sendPos, realPacketSize, SocketFlags.None, _remoteEp);
             if (send > 0)
             {
                 _sendWindow.Push();
-                _sendPos += packetTotalSize;
+                _sendPos += realPacketSize;
                 
                 // Console.WriteLine($"[{Thread.CurrentThread.Name}] Send {header.PacketType} {header.PacketId} {LocalEndPoint} => {_remoteEp}");
 
@@ -497,14 +563,14 @@ public sealed class NetConnection : IDisposable
             }
             else
             {
-                Array.Fill(_sendBuffer, Byte.MinValue, _sendPos, packetTotalSize);
+                Array.Fill(_sendBuffer, Byte.MinValue, _sendPos, realPacketSize);
             }
         }
 
         if (send > 0)
         {
             // buffer it
-            var segment = new ArraySegment<byte>(_sendBuffer, lastSendPos, packetTotalSize);
+            var segment = new ArraySegment<byte>(_sendBuffer, lastSendPos, realPacketSize);
             var bufferedPacket = new BufferedPacket(segment, header);
             _bufferdOutPackets[header.PacketId] = bufferedPacket;
         }
