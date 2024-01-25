@@ -43,24 +43,21 @@ public static class ResponseMessageFactory
 {
     public static ResponseMessage<T> FromError<T>(ResponseError error) where T : class, IBencodedPacket, new()
     {
-        return Activator.CreateInstance(typeof(ResponseMessage<T>), error) as ResponseMessage<T> ??
-               throw new InvalidProgramException();
+        return ResponseMessage<T>.CreateFromError(error);
     }
 
     public static ResponseMessage<T> FromError<T>(Exception e, int errorCode) where T : class, IBencodedPacket, new()
     {
-        return Activator.CreateInstance(typeof(ResponseMessage<T>), e, errorCode) as ResponseMessage<T> ??
-               throw new InvalidProgramException();
+        return ResponseMessage<T>.CreateFromError(e, errorCode);
     }
 
     public static ResponseMessage<T> FromError<T>(string errorMessage, int errorCode) where T : class, IBencodedPacket, new()
     {
-        return Activator.CreateInstance(typeof(ResponseMessage<T>), errorMessage, errorCode) as ResponseMessage<T> ??
-               throw new InvalidProgramException();
+        return ResponseMessage<T>.CreateFromError(errorMessage, errorCode);
     }
 }
 
-public abstract class ResponseMessage<T> : IBencodedPacket where T : class, IBencodedPacket, new()
+public class ResponseMessage<T> : IBencodedPacket where T : class, IBencodedPacket, new()
 {
     private bool _isError;
     private ResponseError? _error;
@@ -73,27 +70,33 @@ public abstract class ResponseMessage<T> : IBencodedPacket where T : class, IBen
         _isError = false;
     }
     
-    public ResponseMessage(ResponseError err)
+    public static ResponseMessage<T> CreateFromError(ResponseError err)
     {
-        _error = err;
-        _isError = true;
+        var inst = new ResponseMessage<T>();
+        inst._error = err;
+        inst._isError = true;
+        return inst;
     }
 
-    public ResponseMessage(Exception e, int errorCode)
+    public static ResponseMessage<T> CreateFromError(Exception e, int errorCode)
     {
-        _error = new ResponseError(e, errorCode);
-        _isError = true;
+        var inst = new ResponseMessage<T>();
+        inst._error = new ResponseError(e, errorCode);
+        inst._isError = true;
+        return inst;
     }
 
-    public ResponseMessage(string errorMessage, int errorCode)
+    public static ResponseMessage<T> CreateFromError(string errorMessage, int errorCode)
     {
-        _error = new ResponseError(errorMessage, errorCode);
-        _isError = true;
+        var inst = new ResponseMessage<T>();
+        inst._error = new ResponseError(errorMessage, errorCode);
+        inst._isError = true;
+        return inst;
     }
 
 
-    protected abstract BDict Serialize();
-    protected abstract void Deserialize(BDict data);
+    protected virtual BDict Serialize() { throw new NotImplementedException(); }
+    protected virtual void Deserialize(BDict data) { throw new NotImplementedException(); }
 
     public BDict BencodedSerialize()
     {

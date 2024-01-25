@@ -26,7 +26,7 @@ public static class BeChatPacketSerializer
     public static byte[] GetBytes<T>(this T obj) where T : IBencodedPacket
     {
         var message = obj.BencodedSerialize();
-        return BencodeSerializer.SerializeBytes(obj);
+        return BencodeSerializer.SerializeBytes(message);
     }
 
     public static T DeserializePacket<T>(Stream stream) where T : IBencodedPacket, new()

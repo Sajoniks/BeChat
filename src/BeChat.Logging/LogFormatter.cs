@@ -8,7 +8,7 @@ public class LogFormatter : ILogFormatter
     private char[] _stringBuffer = new char[1024];
     private static SpinLock _lock = new();
     
-    public ReadOnlyMemory<char> FormatLog(LogLevel level, string category, string message)
+    public string FormatLog(LogLevel level, string category, string message)
     {
         bool locked = false;
         try
@@ -29,14 +29,11 @@ public class LogFormatter : ILogFormatter
 
             _stringBuffer[writePos++] = ']';
 
-            int spaceRemaining = _stringBuffer.Length - writePos;
-            if (spaceRemaining <= message.Length)
-            {
-                message.CopyTo(0, _stringBuffer, writePos, message.Length);
-                writePos += message.Length;
-            }
+            int len = Math.Min(message.Length, _stringBuffer.Length - writePos);
+            message.CopyTo(0, _stringBuffer, writePos, len);
+            writePos += len;
 
-            return new ReadOnlyMemory<char>(_stringBuffer, 0, writePos);
+            return new string(_stringBuffer.AsSpan(0, writePos));
         }
         finally
         {

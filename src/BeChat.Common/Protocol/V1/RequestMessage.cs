@@ -5,9 +5,12 @@ namespace BeChat.Common.Protocol.V1;
 public abstract class RequestMessage<T> : IBencodedPacket where T : RequestMessage<T>, new()
 {
     public static string RequestName { get; protected set; } = "";
-    
+    private string _requestName;
+
     public RequestMessage()
-    { }
+    {
+        _requestName = RequestName;
+    }
 
     protected abstract BDict Serialize();
     protected abstract void Deserialize(BDict data);
@@ -32,14 +35,16 @@ public abstract class RequestMessage<T> : IBencodedPacket where T : RequestMessa
     {
         var t = data["t"].ToString();
         var q = data["q"].ToString();
-        
-        if (t.Equals("q") && q.Equals(RequestName) && HasBody)
+        if (!t.Equals("q") || !q.Equals(_requestName))
         {
-            if (data.TryGetValue("bd", out var body))
-            {
-                var content = body as BDict ?? throw new NullReferenceException();
-                Deserialize(content);
-            }
+            throw new InvalidDataException("Tried to deserialize wrong type of request");
+        }
+        if (HasBody)
+        {
+            var content = data["bd"] as BDict ??
+                          throw new NullReferenceException(
+                              "Expected to have content in request that HasBody equals true");
+            Deserialize(content);
         }
     }
 }

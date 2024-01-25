@@ -2,5 +2,5 @@
 
 public interface ILogFormatter
 {
-    public ReadOnlyMemory<char> FormatLog(LogLevel level, string category, string message);
+    public string FormatLog(LogLevel level, string category, string message);
 }

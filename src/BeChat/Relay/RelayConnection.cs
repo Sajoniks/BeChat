@@ -1,5 +1,7 @@
 ﻿using System.Net;
 using System.Net.Sockets;
+using BeChat.Bencode.Data;
+using BeChat.Bencode.Serializer;
 using BeChat.Common.Protocol;
 using BeChat.Common.Protocol.V1.Messages;
 using BeChat.Logging;
@@ -36,15 +38,35 @@ public class RelayConnection : IDisposable
     {
         if (_connected) throw new InvalidOperationException();
         
-        IPAddress[] hostIp = Array.Empty<IPAddress>();
-        try
+        IPAddress[] hostIp;
+        do
         {
-            await Dns.GetHostAddressesAsync(_relayUri.Host, AddressFamily.InterNetwork, token);
-        }
-        catch (OperationCanceledException)
-        {
-            return;
-        }
+            try
+            {
+                hostIp = await Dns.GetHostAddressesAsync(_relayUri.Host, AddressFamily.InterNetwork, token)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+
+            try
+            {
+                if (hostIp.Length == 0)
+                {
+                    await Task.Delay(1000, token).ConfigureAwait(false);
+                    continue;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+
+            break;
+
+        } while (true);
 
         _relayEp = new IPEndPoint(hostIp[0], _relayUri.Port);
         
@@ -59,15 +81,16 @@ public class RelayConnection : IDisposable
             {
                 token.ThrowIfCancellationRequested();
                 bool shouldDelay = false;
+                
+                
                 if (!_socket.Connected)
                 {
-                    await _socket.DisconnectAsync(true, token).ConfigureAwait(false);
                     _socket = NewSocket();
                     
                     try
                     {
                         using var cancel = CancellationTokenSource.CreateLinkedTokenSource(token);
-                        cancel.CancelAfter(100);
+                        cancel.CancelAfter(250);
                         await _socket.ConnectAsync(_relayEp, cancel.Token).ConfigureAwait(false);
                     }
                     catch (OperationCanceledException)
@@ -82,20 +105,41 @@ public class RelayConnection : IDisposable
                 {
                     var welcomeRequest = new WelcomeRequest();
                     clientVersion = welcomeRequest.ClientVersion;
-                    _socket.Send(welcomeRequest.GetBytes());
-
-                    int recv = _socket.Receive(buffer);
-                    var response = BeChatPacketSerializer.FromBytes<WelcomeResponse>(buffer.AsSpan(0, recv));
-
-                    if (response.IsError)
+                    try
                     {
-                        _logger.LogError("Error during connection to relay: {0}", response.Error!.Message);
-                        await _socket.DisconnectAsync(true, token).ConfigureAwait(false);
-                        return;
+                        await _socket.SendAsync(welcomeRequest.GetBytes(), SocketFlags.None, token);
+
+                        using var cancelToken = CancellationTokenSource.CreateLinkedTokenSource(token);
+                        cancelToken.CancelAfter(1000);
+                        
+                        int recv = await _socket.ReceiveAsync(buffer, SocketFlags.None,cancelToken.Token);
+                        var response = BeChatPacketSerializer.FromBytes<WelcomeResponse>(buffer.AsSpan(0, recv));
+
+                        if (response.IsError)
+                        {
+                            _logger.LogError("Error during connection to relay: {0}", response.Error!.Message);
+                            await _socket.DisconnectAsync(true, token).ConfigureAwait(false);
+                            return;
+                        }
+                        else
+                        {
+                            actualVersion = response.ActualVersion;
+                        }
                     }
-                    else
+                    catch (OperationCanceledException)
                     {
-                        actualVersion = response.ActualVersion;
+                        if (token.IsCancellationRequested)
+                        {
+                            return;
+                        }
+                        else
+                        {
+                            shouldDelay = true;
+                        }
+                    }
+                    catch (Exception)
+                    {
+                        shouldDelay = true;
                     }
                 }
 
@@ -132,6 +176,21 @@ public class RelayConnection : IDisposable
         }
     }
 
+    public async Task Send(IBencodedPacket packet, CancellationToken token = default(CancellationToken))
+    {
+        await _socket.SendAsync(packet.GetBytes(), SocketFlags.None, token);
+    }
+
+    public async Task<T> Receive<T>(CancellationToken token = default(CancellationToken)) where T : IBencodedPacket, new()
+    {
+        var buffer = new byte[512];
+        int recv = await _socket.ReceiveAsync(buffer, SocketFlags.None);
+        var inst = BencodeSerializer.Deserialize<BDict>(buffer.AsSpan(0, recv));
+        var obj = new T();
+        obj.BencodedDeserialize(inst);
+        return obj;
+    }
+    
     public void Dispose()
     {
         if (_connected)

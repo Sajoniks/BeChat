@@ -4,6 +4,26 @@
 using System.Net;
 using System.Text;
 using BeChat.Network;
+using NSec.Cryptography;
+
+// var bobKey = Key.Create(KeyAgreementAlgorithm.X25519);
+// var aliceKey = Key.Create(KeyAgreementAlgorithm.X25519);
+//
+// var bobSecret = KeyAgreementAlgorithm.X25519.Agree(bobKey, aliceKey.PublicKey);
+// var aliceSecret = KeyAgreementAlgorithm.X25519.Agree(aliceKey, bobKey.PublicKey);
+//
+// var bobEncKey = KeyDerivationAlgorithm.HkdfSha256.DeriveKey(bobSecret, new byte[12], new byte[12], AeadAlgorithm.Aes256Gcm);
+// var aliceEncKey = KeyDerivationAlgorithm.HkdfSha256.DeriveKey(aliceSecret, new byte[12], new byte[12], AeadAlgorithm.Aes256Gcm);
+//
+// var x = Encoding.ASCII.GetBytes( Convert.ToBase64String( Encoding.UTF8.GetBytes("Hello World") ) );
+//
+// var enc = AeadAlgorithm.Aes256Gcm.Encrypt(bobEncKey, new byte[12], new byte[12], x);
+// var dec = AeadAlgorithm.Aes256Gcm.Decrypt(aliceEncKey, new byte[12], new byte[12], enc);
+//
+// var xx = Encoding.UTF8.GetString(Convert.FromBase64String( Encoding.ASCII.GetString(dec) ));
+//
+// Console.WriteLine("Done");
+
 
 var factory = new NetConnectionFactory("BeChat.Test");
 
@@ -39,7 +59,7 @@ var t1 = new Thread(() =>
         
         Console.WriteLine($"Thread {Thread.CurrentThread.Name} received message: {recvMessage}");
 
-        Thread.Sleep(100);
+        Thread.Sleep(500);
     }
 });
 var t2 = new Thread(() =>

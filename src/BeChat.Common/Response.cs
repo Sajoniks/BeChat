@@ -38,6 +38,6 @@ public sealed class Response
 
     public byte[] GetBytes()
     {
-        return BencodeSerializer.SerializeBytes(_responseContent);
+        return BencodeSerializer.SerializeBytes(_responseContent.BencodedSerialize());
     }
 }
