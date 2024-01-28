@@ -239,7 +239,7 @@ public sealed class Bootstrap
     }
 }
 
-public sealed class BeChatApplication : IApplication
+public sealed class BeChatApplication : IApplication, IDisposable
 {
     private IServiceProvider? _serviceProvider;
     private ILogger? _logger;
@@ -251,7 +251,8 @@ public sealed class BeChatApplication : IApplication
     public ILogger Logger => _logger ?? throw new InvalidProgramException();
     public IConfiguration Configuration => _configuration ?? throw new InvalidProgramException();
     public Bootstrap Bootstrap => _bootstrap ?? throw new InvalidProgramException();
-    
+    public string Version => _relayConnection?.Version ?? ""
+    ;
     private BeChatApplication()
     {
     }
@@ -327,5 +328,11 @@ public sealed class BeChatApplication : IApplication
         action(services);
 
         GetRequiredServices(services);
+    }
+
+    public void Dispose()
+    {
+        _logger?.Dispose();
+        _relayConnection?.Dispose();
     }
 }

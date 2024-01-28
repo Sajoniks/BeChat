@@ -218,8 +218,14 @@ public class AsyncConsoleSpinner : IDisposable
             // ignored
         }
     }
+
+    public void SpinAsync(string text)
+    {
+        Text = text;
+        SpinAsync();
+    }
     
-    public void RunAsync()
+    public void SpinAsync()
     {
         if (_run == 2)
         {

@@ -3,7 +3,6 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using BeChat.Common.Entity;
-using BeChat.Common.Protocol.V1.Messages;
 using BeChat.Network;
 
 namespace BeChat.Client.App;

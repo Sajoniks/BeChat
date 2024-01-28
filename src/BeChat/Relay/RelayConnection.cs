@@ -1,9 +1,11 @@
-﻿using System.Net;
+﻿using System.Collections.Concurrent;
+using System.Net;
 using System.Net.Sockets;
+using System.Reflection;
 using BeChat.Bencode.Data;
 using BeChat.Bencode.Serializer;
 using BeChat.Common.Protocol;
-using BeChat.Common.Protocol.V1.Messages;
+using BeChat.Common.Protocol.V1;
 using BeChat.Logging;
 
 namespace BeChat.Relay;
@@ -13,11 +15,21 @@ public class RelayConnection : IDisposable
     private Socket _socket;
     private IPEndPoint? _relayEp;
     private bool _connected;
+    private bool _isconnecting = false;
     
     private readonly ILogger _logger;
     private readonly Uri _relayUri;
+    private string _appVer = "";
 
+    private Thread _pollThread;
+    private CancellationTokenSource _pollCts;
+
+    private Queue<Response> _queuedMessages;
+    private Dictionary<string, IRelayMessageNotify> _listeners;
+    private ManualResetEventSlim _resetEvent;
+    
     public bool Connected => _connected;
+    public string Version => _appVer;
     
     private static Socket NewSocket()
     {
@@ -30,10 +42,79 @@ public class RelayConnection : IDisposable
     public RelayConnection(Uri uri, ILogger logger)
     {
         _socket = NewSocket();
+        _listeners = new Dictionary<string, IRelayMessageNotify>();
+        _resetEvent = new ManualResetEventSlim();
+        _queuedMessages = new Queue<Response>();
+        _pollCts = new CancellationTokenSource();
+        _pollThread = new Thread(PollThread);
         _relayUri = uri;
         _logger = logger;
     }
-    
+
+    public void AddListener(string messageId, IRelayMessageNotify notify)
+    {
+        _listeners[messageId] = notify;
+    }
+
+    private void PollThread()
+    {
+        while (true)
+        {
+            if (_pollCts.IsCancellationRequested)
+            {
+                return;
+            }
+
+            if (_socket.Available > 0)
+            {
+                var buffer = new byte[_socket.Available];
+                _socket.Receive(buffer);
+                var response = new Response(BencodeSerializer.Deserialize<BDict>(buffer));
+
+                bool asyncReceived = false;
+                if (_listeners.ContainsKey(response.RequestName))
+                {
+                    bool genericInvoke = true;
+                    
+                    var listener = _listeners[response.RequestName];
+                    var methods = listener.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance);
+                    foreach (var method in methods)
+                    {
+                        var attr = method.GetCustomAttribute<RelayMessageHandlerAttribute>();
+                        if (attr is not null && attr.MessageName.Equals(response.RequestName))
+                        {
+                            var inputType = method.GetParameters()[0].ParameterType;
+                            var content = response.ReadContent(inputType);
+                            if (content is not null)
+                            {
+                                method.Invoke(listener, new[] { content });
+                                genericInvoke = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (genericInvoke)
+                    {
+                        _listeners[response.RequestName].ReceiveRelayMessage(response);
+                    }
+
+                    asyncReceived = true;
+                }
+
+                if (!asyncReceived)
+                {
+                    _queuedMessages.Enqueue(response);
+
+                    if (_queuedMessages.Count == 1)
+                    {
+                        _resetEvent.Set();
+                    }
+                }
+            }
+        }
+    }
+
     public async Task ConnectToRelayAsync(CancellationToken token)
     {
         if (_connected) throw new InvalidOperationException();
@@ -77,6 +158,7 @@ public class RelayConnection : IDisposable
 
         while (true)
         {
+            _isconnecting = true;
             try
             {
                 token.ThrowIfCancellationRequested();
@@ -103,27 +185,32 @@ public class RelayConnection : IDisposable
                 string clientVersion = "";
                 if (!shouldDelay)
                 {
-                    var welcomeRequest = new WelcomeRequest();
-                    clientVersion = welcomeRequest.ClientVersion;
+                    var welcomeRequest = new NetMessageWelcome
+                    {
+                        Version = "1.0.0"
+                    };
+                    clientVersion = welcomeRequest.Version;
                     try
                     {
-                        await _socket.SendAsync(welcomeRequest.GetBytes(), SocketFlags.None, token);
+                        await SendAsync(welcomeRequest, token).ConfigureAwait(false);
 
                         using var cancelToken = CancellationTokenSource.CreateLinkedTokenSource(token);
                         cancelToken.CancelAfter(1000);
-                        
-                        int recv = await _socket.ReceiveAsync(buffer, SocketFlags.None,cancelToken.Token);
-                        var response = BeChatPacketSerializer.FromBytes<WelcomeResponse>(buffer.AsSpan(0, recv));
 
+                        var response = await ReceiveAsync().ConfigureAwait(false);
                         if (response.IsError)
                         {
-                            _logger.LogError("Error during connection to relay: {0}", response.Error!.Message);
+                            var error = response.ReadContent<ResponseError>();
+                            
+                            _logger.LogError("Error during connection to relay: {0}", error.Message);
+                            
                             await _socket.DisconnectAsync(true, token).ConfigureAwait(false);
                             return;
                         }
                         else
                         {
-                            actualVersion = response.ActualVersion;
+                            var content = response.ReadContent<NetMessageWelcome>();
+                            actualVersion = content.Version;
                         }
                     }
                     catch (OperationCanceledException)
@@ -163,9 +250,12 @@ public class RelayConnection : IDisposable
                     else
                     {
                         _logger.LogTrace("Connected to relay at {0}", _socket.RemoteEndPoint);
+                        _appVer = actualVersion;
                         _connected = true;
                     }
 
+                    _isconnecting = false;
+                    _pollThread.Start();
                     return;
                 }
             }
@@ -174,27 +264,69 @@ public class RelayConnection : IDisposable
                 break;
             }
         }
+
     }
 
-    public async Task Send(IBencodedPacket packet, CancellationToken token = default(CancellationToken))
+    public Task SendAsync<T>(T message, CancellationToken token = default) where T : new() 
+        => SendAsync(Request.FromMessage(message), token);
+    
+    public async Task SendAsync(Request packet, CancellationToken token = default)
     {
         await _socket.SendAsync(packet.GetBytes(), SocketFlags.None, token);
     }
 
-    public async Task<T> Receive<T>(CancellationToken token = default(CancellationToken)) where T : IBencodedPacket, new()
+    public Response Receive()
     {
-        var buffer = new byte[512];
-        int recv = await _socket.ReceiveAsync(buffer, SocketFlags.None);
-        var inst = BencodeSerializer.Deserialize<BDict>(buffer.AsSpan(0, recv));
-        var obj = new T();
-        obj.BencodedDeserialize(inst);
-        return obj;
+        if (_isconnecting)
+        {
+            var buffer = new byte[512];
+            int recv = _socket.Receive(buffer);
+
+            return new Response(BencodeSerializer.Deserialize<BDict>(buffer.AsSpan(0, recv)));
+        }
+        else
+        {
+            if (_queuedMessages.Count == 0)
+            {
+                _resetEvent.Wait();
+                _resetEvent.Reset();
+            }
+
+            return _queuedMessages.Dequeue();
+        }
+    }
+
+    public async Task<Response> ReceiveAsync()
+    {
+        if (_isconnecting)
+        {
+            var buffer = new byte[512];
+            int recv = await _socket.ReceiveAsync(buffer, SocketFlags.None).ConfigureAwait(false);
+
+            return new Response(BencodeSerializer.Deserialize<BDict>(buffer.AsSpan(0, recv)));
+        }
+        else
+        {
+            if (_queuedMessages.Count == 0)
+            {
+                await Task.Run(() =>
+                {
+                    _resetEvent.Wait();
+                    _resetEvent.Reset();
+
+                }).ConfigureAwait(false);
+            }
+
+            return _queuedMessages.Dequeue();
+        }
     }
     
     public void Dispose()
     {
         if (_connected)
         {
+            _pollCts.Cancel();
+            _pollThread.Join();
             _socket.Disconnect(true);
         }
     }
