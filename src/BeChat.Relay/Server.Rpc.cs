@@ -171,12 +171,20 @@ public partial class Server
 
             foreach (var invitation in invitations)
             {
-                queue.Enqueue(Response.CreateGenericResponse(invitation));
+                queue.Enqueue(Response.CreateGenericResponse(new NetNotifyNewInvitation
+                {
+                    UserId = invitation.UserId,
+                    UserName = invitation.UserName
+                }));
             }
 
             foreach (var friend in friends)
             {
-                queue.Enqueue(Response.CreateGenericResponse(friend));
+                queue.Enqueue(Response.CreateGenericResponse(new NetNotifyNewFriend
+                {
+                    UserId = friend.UserId,
+                    UserName = friend.UserName
+                }));
             }
         }
 
