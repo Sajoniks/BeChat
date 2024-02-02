@@ -83,7 +83,7 @@ public static partial class BencodeSerializer
 
         public override BencodedBase GetObject()
         {
-            return new BInteger();
+            return new BInteger(_item);
         }
     }
 

@@ -247,11 +247,20 @@ public class AsyncConsoleSpinner : IDisposable
             _wrappee.Clear();
         }
     }
-    
-    public void Stop()
+
+    public void Stop(bool clear = false)
     {
-        _cts.Cancel();
-        _resetEvent.WaitOne();
+        if (_run == 1)
+        {
+            _cts.Cancel();
+            _resetEvent.WaitOne();
+            _run = 0;
+        }
+
+        if (clear)
+        {
+            _wrappee.Clear();
+        }
     }
 
     public string Text

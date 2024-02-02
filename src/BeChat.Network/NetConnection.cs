@@ -6,6 +6,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Timers;
 using NSec.Cryptography;
+using Timer = System.Timers.Timer;
 
 namespace BeChat.Network;
 
@@ -33,7 +34,7 @@ public sealed class NetConnection : IDisposable
         /// </summary>
         public Header(ReadOnlySpan<byte> b)
         {
-            if ((uint)b.Length != (uint)PacketHeaderFields.HeaderSize)
+            if ((uint)b.Length < (uint)PacketHeaderFields.HeaderSize)
             {
                 throw new ArgumentException();
             }
@@ -187,9 +188,10 @@ public sealed class NetConnection : IDisposable
     
     private readonly uint _protocolId;
     private readonly Socket _socket;
-    private EndPoint? _remoteEp;
 
-    private bool _connected = false;
+    private volatile bool _connected = false;
+    private volatile EndPoint? _remoteEp;
+
     public bool Connected => _connected;
     public EndPoint? LocalEndPoint => _socket.LocalEndPoint;
     public EndPoint? RemoteEndPoint => _remoteEp;
@@ -203,7 +205,6 @@ public sealed class NetConnection : IDisposable
     private readonly Dictionary<uint, BufferedPacket> _bufferedInPackets = new();
     private readonly Dictionary<uint, BufferedPacket> _bufferdOutPackets = new();
     
-    
     private readonly byte[] _recvBuffer = new byte[16 * 1024 * 1024];
     private int _recvPos = 0;
     private readonly byte[] _sendBuffer = new byte[16 * 1024 * 1024];
@@ -212,7 +213,6 @@ public sealed class NetConnection : IDisposable
     private bool _disposed = false;
     private volatile bool _timeout = false;
 
-    private bool _sendEncryption = false;
     private Key? _key;
     private SharedSecret? _secret;
 
@@ -250,125 +250,345 @@ public sealed class NetConnection : IDisposable
         _socket.Bind(endPoint);
     }
 
-    public void Connect(IPEndPoint endPoint)
+    public async Task ConnectAsync(IPEndPoint endPoint, CancellationToken token)
     {
-        byte[] outgoingPacket = ArrayPool<byte>.Shared.Rent(128);
-        byte[] incomingPacket = ArrayPool<byte>.Shared.Rent(128);
-        BinaryPrimitives.WriteUInt32BigEndian(outgoingPacket, _protocolId);
+        var sl = new SpinLock();
 
-        EndPoint ep = new IPEndPoint(IPAddress.Any, 0);
-        _socket.Blocking = false;
+        bool connectionEstablished = false;
+        
+        bool sentEncryption = false;
+        bool receivedEncryption = false;
+        
+        bool sentEncryptionAck = false;
+        bool receivedEncryptionAck = false;
+        
+        byte[] keyBuffer = Array.Empty<byte>();
 
-        bool connected = false;
-        Stopwatch sendClock = new Stopwatch();
+        bool retryPacket = false;
+        
+        Timer timer = new Timer();
+        timer.Interval = 2000;
+        timer.AutoReset = true;
+        timer.Elapsed += (_, _) =>
+        {
+            bool locked = false;
+            try
+            {
+                sl.TryEnter(ref locked);
+                retryPacket = true;
+            }
+            finally
+            {
+                if (locked) sl.Exit();
+            }
+        };
+        timer.Start();
+
+        byte[] packetBuffer = new byte[128];
+        using MemoryStream packetStream = new MemoryStream(packetBuffer, 0, packetBuffer.Length, writable: true, publiclyVisible: true);
+        using BinaryReader packetReader = new BinaryReader(packetStream);
+        using BinaryWriter packetWriter = new BinaryWriter(packetStream);
+
+        static async Task<bool> SendPacket(Socket socket, MemoryStream packetStream, EndPoint ep, CancellationToken innerToken)
+        {
+            try
+            {
+                var segment = new ArraySegment<byte>(packetStream.GetBuffer(), 0, (int)packetStream.Position);
+                await socket.SendToAsync(segment, SocketFlags.None, ep, innerToken).ConfigureAwait(false);
+                return true;
+            }
+            catch (OperationCanceledException e)
+            {
+                if (innerToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+
+                return false;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        Task<bool> SendProtocol()
+        {
+            packetStream.Position = 0;
+            var protocolId = (uint) IPAddress.HostToNetworkOrder((int) _protocolId);
+            packetWriter.Write(protocolId);
+            
+            Debug.WriteLine("NetConnection send protocol packet [{0} -> {1}]", LocalEndPoint, endPoint);
+            return SendPacket(_socket, packetStream, endPoint, token);
+        }
+
+        Task<bool> SendEncryption()
+        {
+            packetStream.Position = 0;
+            bool locked = false;
+            try
+            {
+                sl.TryEnter(ref locked);
+                    
+                // send encryption
+                if (!sentEncryption)
+                {
+                    _key = new Key(KeyAgreementAlgorithm.X25519);
+                    keyBuffer = _key.Export(KeyBlobFormat.RawPublicKey);
+                }
+
+                var header = new Header
+                {
+                    PacketType = PacketType.Enk,
+                    ProtocolId = _protocolId
+                };
+
+                packetStream.Position = 0;
+                header.WriteBytes(packetStream);
+                packetWriter.Write(IPAddress.HostToNetworkOrder(keyBuffer.Length));
+                packetWriter.Write(keyBuffer);
+            }
+            finally
+            {
+                if (locked) sl.Exit();
+            }
+
+            Debug.WriteLine("NetConnection send encryption packet [{0} -> {1}]", LocalEndPoint, endPoint);
+            return SendPacket(_socket, packetStream, endPoint, token);
+        }
+
+        Task<bool> SendEncryptionAck()
+        {
+            packetStream.Position = 0;
+            Header responseH = new Header
+            {
+                ProtocolId = _protocolId,
+                PacketType = PacketType.EnkAck
+            };
+            responseH.WriteBytes(packetStream);
+
+            Debug.WriteLine("NetConnection send encryption ack packet [{0} -> {1}]", LocalEndPoint, endPoint);
+            return SendPacket(_socket, packetStream, endPoint, token);
+        }
 
         try
         {
-            _socket.SendTo(outgoingPacket, 4, SocketFlags.None, endPoint);
-            sendClock.Start();
-
-            while (!_connected)
-            {
-                try
-                {
-                    if (!connected && _socket.Poll(150, SelectMode.SelectRead))
-                    {
-                        int recv = _socket.ReceiveFrom(incomingPacket, ref ep);
-                        var ipEp = ep as IPEndPoint ?? throw new InvalidProgramException();
-
-                        if (ipEp.Port.Equals(endPoint.Port) && recv == 4 && !_sendEncryption)
-                        {
-                            uint recvProtocolId = BinaryPrimitives.ReadUInt32BigEndian(incomingPacket);
-                            if (recvProtocolId == _protocolId)
-                            {
-                                _remoteEp = ep;
-                                _key = new Key(KeyAgreementAlgorithm.X25519);
-
-                                var header = new Header
-                                {
-                                    PacketType = PacketType.Enk,
-                                    ProtocolId = _protocolId
-                                };
-                                
-                                using var memoryStream = new MemoryStream();
-                                header.WriteBytes(memoryStream);
-                                var data = _key.Export(KeyBlobFormat.RawPublicKey);
-                                memoryStream.Write(BitConverter.GetBytes(IPAddress.HostToNetworkOrder(data.Length)));
-                                memoryStream.Write(data);
-
-                                _socket.SendTo(memoryStream.ToArray(), _remoteEp);
-                                _sendEncryption = true;
-                            }
-                        }
-                        else if (_sendEncryption && _remoteEp is not null && _remoteEp.Equals(ipEp) && recv >= Header.HeaderSize)
-                        {
-                            var header = new Header(incomingPacket.AsSpan(0, Header.HeaderSize));
-                            switch (header.PacketType)
-                            {
-                                case PacketType.Enk:
-                                {
-                                    using (var stream = new MemoryStream(incomingPacket, Header.HeaderSize, recv - Header.HeaderSize))
-                                    using (var reader = new BinaryReader(stream))
-                                    {
-                                        int dataLen = IPAddress.NetworkToHostOrder(reader.ReadInt32());
-                                        var data = reader.ReadBytes(dataLen);
-
-                                        _secret = KeyAgreementAlgorithm.X25519.Agree(_key,
-                                            PublicKey.Import(KeyAgreementAlgorithm.X25519, data,
-                                                KeyBlobFormat.RawPublicKey));
-                                    }
-                                    
-                                    // send ack
-                                    using (var stream = new MemoryStream())
-                                    {
-                                        var ackHeader = new Header
-                                        {
-                                            ProtocolId = _protocolId,
-                                            PacketType = PacketType.EnkAck
-                                        };
-                                        ackHeader.WriteBytes(stream);
-                                        _socket.SendTo(stream.ToArray(), _remoteEp);
-                                    }
-                                }
-                                break;
-
-                                case PacketType.EnkAck:
-                                {
-                                    // we are ready 
-                                    _connected = true;
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-                catch (SocketException)
-                {
-                    // ignored
-                }
-
-                
-                if (sendClock.ElapsedMilliseconds >= 100)
-                {
-                    sendClock.Restart();
-                    _socket.SendTo(outgoingPacket, 5, SocketFlags.None, endPoint);
-                }
-            }
+            await SendProtocol();
         }
         catch (Exception)
         {
-            // Failure
+            return;
         }
-        finally
+
+        while (!connectionEstablished)
         {
-            ArrayPool<byte>.Shared.Return(outgoingPacket);
-            ArrayPool<byte>.Shared.Return(incomingPacket);
+            token.ThrowIfCancellationRequested();
+            packetStream.Position = 0;
+            
+            if (retryPacket)
+            {
+                try
+                {
+                    if (!receivedEncryption)
+                    {
+                        await SendProtocol();
+                    }
+                    else
+                    {
+                        if (!receivedEncryptionAck)
+                        {
+                            await SendEncryption();
+                        }
+                    }
+                }
+                catch (Exception e)
+                {
+                    Debug.WriteLine(e.Message);
+                    continue;
+                }
+                retryPacket = false;
+            }
+
+            if (!_socket.Poll(0, SelectMode.SelectRead))
+            {
+                continue;
+            }
+
+            EndPoint recvFromEp;
+            int recvPktLen = 0;
+            try
+            {
+                SocketReceiveFromResult result = await _socket
+                    .ReceiveFromAsync(packetBuffer, SocketFlags.None, endPoint, token)
+                    .ConfigureAwait(false);
+
+                recvPktLen = result.ReceivedBytes;
+                recvFromEp = result.RemoteEndPoint;
+            }
+            catch (Exception e)
+            {
+                Debug.WriteLine(e.Message);
+                continue;
+            }
+
+            if (!recvFromEp.Equals(endPoint))
+            {
+                continue;
+            }
+            
+            if (recvPktLen == sizeof(UInt32)) // protocol received
+            {
+                uint recvProtocol = (uint) IPAddress.NetworkToHostOrder(packetReader.ReadInt32());
+                if (recvProtocol != _protocolId)
+                {
+                    // this is not our protocol
+                    continue;
+                }
+                
+                Debug.WriteLine("NetConnection received protocol [{0} <- {1}]", LocalEndPoint, endPoint);
+
+                if (receivedEncryption)
+                {
+                    try
+                    {
+                        await SendEncryptionAck();
+                        sentEncryptionAck = true;
+                    }
+                    catch (Exception e)
+                    {
+                        Debug.WriteLine(e.Message);
+                        continue;
+                    }
+                }
+                
+                try
+                {
+                    await SendEncryption();
+                    sentEncryption = true;
+                }
+                catch (Exception e)
+                {
+                    Debug.WriteLine(e.Message);
+                    continue;
+                }
+            }
+            else
+            {
+                Header h;
+                try
+                {
+                    h = new Header(packetBuffer.AsSpan(0, recvPktLen));
+                    packetStream.Position += Header.HeaderSize;
+                }
+                catch (Exception e)
+                {
+                    Debug.WriteLine(e.Message);
+                    continue;
+                }
+                
+                if (h.ProtocolId != _protocolId)
+                {
+                    continue;
+                }
+
+                switch (h.PacketType)
+                {
+                    case PacketType.Enk:
+                    {
+                        // received encryption
+                        int keyLen = IPAddress.NetworkToHostOrder(packetReader.ReadInt32());
+                        var keyBytes = packetReader.ReadBytes(keyLen);
+
+                        if (!sentEncryption)
+                        {
+                            try
+                            {
+                                await SendEncryption();
+                                sentEncryption = true;
+                            }
+                            catch (Exception e)
+                            {
+                                Debug.WriteLine(e.Message);
+                                continue;
+                            }
+                        }
+                        
+                        try
+                        {
+                            PublicKey otherPublicKey = PublicKey.Import(KeyAgreementAlgorithm.X25519, keyBytes,
+                                KeyBlobFormat.RawPublicKey);
+                            _secret = KeyAgreementAlgorithm.X25519.Agree(_key!, otherPublicKey);
+
+                            if (_secret is null)
+                            {
+                                continue;
+                            }
+
+                            receivedEncryption = true;
+                            Debug.WriteLine("NetConnection received encryption [{0} <- {1}]", LocalEndPoint, endPoint);
+                        }
+                        catch (Exception e)
+                        {
+                            Debug.WriteLine(e.Message);
+                            continue;
+                        }
+                        
+                        try
+                        {
+                            await SendEncryptionAck();
+                            sentEncryptionAck = true;
+                        }
+                        catch (Exception e)
+                        {
+                            Debug.WriteLine(e.Message);
+                            continue;
+                        }
+                    }
+                    break;
+
+                    case PacketType.EnkAck:
+                    {
+                        // other side has received our encryption
+                        // connection established
+                        receivedEncryptionAck = true;
+                        Debug.WriteLine("NetConnection received ack encryption [{0} <- {1}]", LocalEndPoint, endPoint);
+                        
+                        if (receivedEncryption && sentEncryptionAck)
+                        {
+                            Debug.WriteLine("NetConnection connection establised [{0} <==> {1}]", LocalEndPoint, endPoint);
+                            connectionEstablished = true;
+                        }
+
+                        if (!sentEncryption)
+                        {
+                            try
+                            {
+                                await SendEncryption();
+                                sentEncryption = true;
+                            }
+                            catch (Exception e)
+                            {
+                                Debug.WriteLine(e.Message);
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        timer.Stop();
+        
+        if (connectionEstablished)
+        {
+            _remoteEp = endPoint;
+            _connected = true;
         }
     }
 
     public int Receive(byte[] buffer)
     {
-        if (_remoteEp is null)
+        if (_remoteEp is null || !_connected)
         {
             throw new SocketException();
         }

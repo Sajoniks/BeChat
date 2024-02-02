@@ -1,7 +1,7 @@
 ﻿namespace BeChat.Client.ConsoleUtility;
 
 
-public class ConsolePrompt
+public sealed class ConsolePrompt
 {
     public struct Result
     {
@@ -22,6 +22,225 @@ public class ConsolePrompt
     
     private static readonly Settings Default = new();
 
+    private readonly string? _title;
+    private readonly Settings _settings;
+    private int _x;
+    private int _y;
+    private int _xCursor;
+    private int _yCursor;
+    private int _xWrite;
+    private int _yWrite;
+    private int _yBottom;
+    private bool _interrupt;
+    private bool _drawn = false;
+    private bool _focused = false;
+    private Stack<char> _buffer = new();
+    
+    public event EventHandler<Result>? Prompted; 
+
+    public ConsolePrompt(string? title) : this(title, Default)
+    {}
+
+    public ConsolePrompt(string? title, ConsolePrompt.Settings settings)
+    {
+        _title = title;
+        _settings = settings;
+    }
+
+    public void Focus()
+    {
+        if (!_focused)
+        {
+            _focused = true;
+            Console.SetCursorPosition(_xCursor, _yCursor);
+            Console.Write("  > ");
+            Console.SetCursorPosition(_xWrite + _buffer.Count, _yWrite);
+        }
+    }
+
+    public void Unfocus()
+    {
+        if (_focused)
+        {
+            Console.SetCursorPosition(_xCursor, _yCursor);
+            Console.Write("    ");
+            Console.SetCursorPosition(_xWrite + _buffer.Count, _yWrite);
+            _focused = false;
+        }
+    }
+    
+    public void Draw()
+    {
+        if (_drawn)
+        {
+            return;
+        }
+
+        _drawn = true;
+        if (Console.CursorLeft > 0)
+        {
+            Console.WriteLine();
+        }
+        
+        _x = Console.CursorLeft;
+        _y = Console.CursorTop;
+
+        Console.CursorVisible = false;
+
+        if (_title is not null)
+        {
+            // Title
+            Console.Write("- ");
+            Console.Write(_title);
+            Console.WriteLine();
+        }
+
+        // Prompt area
+        _xCursor = Console.CursorLeft;
+        _yCursor = Console.CursorTop;
+        
+        Console.Write("    ");
+        
+        _xWrite = Console.CursorLeft;
+        _yWrite = Console.CursorTop;
+
+        if (_buffer.Count != 0)
+        {
+            Console.Write(_buffer.Reverse().ToArray());
+        }
+        
+        _yBottom = _yWrite;
+    }
+
+    private void OnCanceled(object? o, ConsoleCancelEventArgs args)
+    {
+        args.Cancel = true;
+        _interrupt = true;
+    }
+    
+    public void Close()
+    {
+        if (!_drawn)
+        {
+            return;
+        }
+
+        _drawn = false;
+        _focused = false;
+        
+        Console.CursorTop = _yBottom;
+        while (Console.CursorTop != _y)
+        {
+            Console.CursorLeft = 0;
+            Console.Write(new string(' ', Console.BufferWidth));
+            Console.CursorTop = Math.Max(0, Console.CursorTop - 2);
+        }
+        
+        Console.CursorLeft = _x;
+        Console.Write(new string(' ', Console.BufferWidth - 1 - _x));
+
+        Console.CursorLeft = _x;
+        Console.CursorTop= _y;
+        Console.CursorVisible = true;
+    }
+
+    public string CopyString()
+    {
+        if (_buffer.Any())
+        {
+            return String.Join("", _buffer.Reverse());
+        }
+
+        return "";
+    }
+
+    public void ClearBuffer()
+    {
+        int len = _buffer.Count;
+        if (len > 0)
+        {
+            _buffer.Clear();
+            Console.SetCursorPosition(_xWrite, _yWrite);
+            Console.Write(new string(' ', len));
+            Console.SetCursorPosition(_xWrite, _yWrite);
+        }
+    }
+    
+    public void ConsoleInput(ConsoleKeyInfo key)
+    {
+        Focus();
+
+        bool prompted = false;
+        string? input = null;
+        switch (key.Key)
+        {
+            case ConsoleKey.Enter:
+                if (_buffer.Any())
+                {
+                    input = CopyString();
+                    _buffer.Clear();
+                    Console.SetCursorPosition(_xWrite, _yWrite);
+                    Console.Write(new string(' ', input.Length));
+                    Console.SetCursorPosition(_xWrite, _yWrite);
+                }
+                
+                prompted = true;
+                break;
+
+            case ConsoleKey.Backspace:
+                if (_buffer.Any())
+                {
+                    _buffer.Pop();
+                    Console.SetCursorPosition(_xWrite + _buffer.Count, _yWrite);
+                    Console.Write(' ');
+                    Console.SetCursorPosition(_xWrite + _buffer.Count, _yWrite);
+                }
+
+                break;
+
+            default:
+            {
+                var ch = key.KeyChar;
+                ch = _settings.Modifier?.Invoke(ch) ?? ch;
+
+                bool discard = false;
+                if (_settings.ValidInput is not null)
+                {
+                    discard = !_settings.ValidInput.Contains(ch);
+                }
+                else
+                {
+                    discard = char.IsControl(ch);
+                }
+
+                if (!discard)
+                {
+                    if (_xWrite + _buffer.Count < Console.BufferWidth)
+                    {
+                        Console.SetCursorPosition(_xWrite + _buffer.Count, _yWrite);
+                        _buffer.Push(ch);
+                        Console.Write(ch);
+                    }
+                }
+            }
+                break;
+        }
+
+        
+        if (prompted)
+        {
+            bool validated = input is not null && (_settings.Validator?.Invoke(input) ?? true);
+            if (validated)
+            {
+                Prompted?.Invoke(this, new Result
+                {
+                    Input = input!,
+                    Intercept = false
+                });
+            }
+        }
+    }
+    
     public static Result Prompt(string title)
     {
         return Prompt(title, Default);
@@ -29,157 +248,31 @@ public class ConsolePrompt
     
     public static Result Prompt(string title, Settings settings)
     {
-        bool visible = Console.CursorVisible;
-        Console.CursorVisible = true;
-        int x = Console.CursorLeft;
-        int y = Console.CursorTop;
-        
-        if (Console.CursorLeft > 0)
-        {
-            Console.WriteLine();
-        }
-        
-        Console.Write("- ");
-        Console.WriteLine(title);
-
-        // @todo
-        if (settings.Description is not null)
-        {
-            string desc = settings.Description;
-            
-            Console.Write("  * ");
-            int offset = Console.CursorLeft;
-            int lineLength = Console.BufferWidth - offset - 1;
-
-            for (int i = 0; i < desc.Length; i += lineLength)
-            {
-                ReadOnlySpan<char> span = settings.Description.AsSpan(i, Math.Min(i + lineLength, desc.Length));
-                foreach (var ch in span)
-                {
-                    Console.Write(ch);
-                }
-                Console.WriteLine();
-            }
-        }
-        
-        Console.Write("  > ");
-
-        Stack<char> buffer = new Stack<char>();
-        
-        string? input = null;
         bool prompted = false;
-        bool interrupt = false;
-        bool validated = false;
-
-        void OnCanceled(object? o, ConsoleCancelEventArgs args)
+        Result? r = null;
+        
+        var prompt = new ConsolePrompt(title, settings);
+        prompt.Prompted += (_, args) =>
         {
-            args.Cancel = true;
-            interrupt = true;
-        }
-
-        bool prevFlag = Console.TreatControlCAsInput;
-        if (settings.InterceptSigsev)
-        {
-            Console.TreatControlCAsInput = false;
-            Console.CancelKeyPress += OnCanceled;
-        }
-
-        int pos = Console.CursorLeft;
+            prompted = true;
+            r = args;
+        };
+        prompt.Draw();
         do
         {
-            do
+            if (Console.KeyAvailable)
             {
-                if (interrupt)
-                {
-                    input = "";
-                    break;
-                }
-                
-                if (!Console.KeyAvailable)
-                {
-                    continue;
-                }
-
                 var key = Console.ReadKey(intercept: true);
-                switch (key.Key)
-                {
-                    case ConsoleKey.Enter:
-                        if (buffer.Any())
-                        {
-                            input = String.Join("", buffer.Reverse());
-                            buffer.Clear();
-                            Console.CursorLeft = pos;
-                            Console.Write(new string(' ', input.Length));
-                            Console.CursorLeft = pos;
-                        }
+                prompt.ConsoleInput(key);
+            }
+        } while (!prompted);
+        prompt.Close();
 
-                        prompted = true;
-
-                        break;
-
-                    case ConsoleKey.Backspace:
-                        if (buffer.Any())
-                        {
-                            buffer.Pop();
-                            Console.CursorLeft--;
-                            Console.Write(' ');
-                            Console.CursorLeft--;
-                        }
-
-                        break;
-
-                    default:
-                    {
-                        var ch = key.KeyChar;
-                        ch = settings.Modifier?.Invoke(ch) ?? ch;
-
-                        bool discard = false;
-                        if (settings.ValidInput is not null)
-                        {
-                            discard = !settings.ValidInput.Contains(ch);
-                        }
-                        else
-                        {
-                            discard = char.IsControl(ch);
-                        }
-
-                        if (!discard)
-                        {
-                            buffer.Push(ch);
-                            Console.Write(ch);
-                        }
-                    }
-                        break;
-                }
-            } while (!prompted);
-
-            validated = input is not null && (settings.Validator?.Invoke(input) ?? true);
-            
-        } while (!interrupt && !validated);
-
-        if (settings.InterceptSigsev)
+        if (r is null)
         {
-            Console.TreatControlCAsInput = prevFlag;
-            Console.CancelKeyPress -= OnCanceled;
+            throw new InvalidProgramException();
         }
         
-        while (Console.CursorTop != y)
-        {
-            Console.CursorLeft = 0;
-            Console.Write(new string(' ', Console.BufferWidth));
-            Console.CursorTop = Math.Max(0, Console.CursorTop - 2);
-        }
-
-        Console.CursorLeft = x;
-        Console.Write(new string(' ', Console.BufferWidth - 1 - x));
-
-        Console.CursorLeft = x;
-        Console.CursorTop= y;
-        Console.CursorVisible = visible;
-        return new Result
-        {
-            Input = input!,
-            Intercept = interrupt
-        };
+        return r.Value;
     }
 }

@@ -1,4 +1,7 @@
-﻿using System.Collections;
+﻿using System.Buffers.Binary;
+using System.Collections;
+using System.Net;
+using System.Net.Sockets;
 using System.Reflection;
 using BeChat.Bencode.Data;
 
@@ -13,9 +16,12 @@ public static partial class BencodeSerializer
         { typeof(BInteger), typeof(BInteger) },
         { typeof(BString), typeof(BString) },
         { typeof(long), typeof(BInteger) },
+        { typeof(bool), typeof(BInteger) },
         { typeof(string), typeof(BString) },
         { typeof(byte[]), typeof(BString) },
-        { typeof(Guid), typeof(BString) }
+        { typeof(Guid), typeof(BString) },
+        { typeof(IPEndPoint), typeof(BString) },
+        { typeof(DateTime), typeof(BInteger) }
     };
 
     public static bool IsBObject(Type type)
@@ -204,10 +210,27 @@ public static partial class BencodeSerializer
                             {
                                 PropertyUtilits.SetPropertyValue(type, prop, obj, new Guid(bytes.Span));
                             }
+                            else if (prop.PropertyType == typeof(IPEndPoint))
+                            {
+                                uint ip = 0;
+                                ushort port = 0;
+
+                                ip = BinaryPrimitives.ReadUInt32BigEndian(bytes.Span);
+                                port = BinaryPrimitives.ReadUInt16BigEndian(bytes.Span.Slice(4));
+                                
+                                PropertyUtilits.SetPropertyValue(type, prop, obj, new IPEndPoint(ip, port));
+                            }
                             else if (prop.PropertyType.IsArray &&
                                      prop.PropertyType.GenericTypeArguments[0] == typeof(byte))
                             {
                                 PropertyUtilits.SetPropertyValue(type, prop, obj, bytes.ToArray());
+                            }
+                        }
+                        else if (bencoded.Type == BencodedType.Integer)
+                        {
+                            if (prop.PropertyType == typeof(DateTime))
+                            {
+                                PropertyUtilits.SetPropertyValue(type, prop, obj, new DateTime(bencoded.AsInteger()));
                             }
                         }
                     }
@@ -231,14 +254,42 @@ public static partial class BencodeSerializer
             switch (bObject.Type)
             {
                 case BencodedType.Integer:
-                    var number = (long)obj;
-                    return new BInteger(number);
-
+                    if (obj is DateTime)
+                    {
+                        var dt = (DateTime)obj;
+                        return new BInteger(dt.Ticks);
+                    }
+                    else if (obj is bool)
+                    {
+                        return new BInteger((bool)obj ? 1 : 0);
+                    }
+                    else
+                    {
+                        var number = (long)obj;
+                        return new BInteger(number);
+                    }
+                    break;
+                
                 case BencodedType.String:
                     {
                         if (obj is string)
                         {
                             return new BString((string) obj);
+                        }
+                        else if (obj is IPEndPoint)
+                        {
+                            var ep = (IPEndPoint)obj;
+                            if (ep.AddressFamily == AddressFamily.InterNetwork)
+                            {
+                                var ipBuffer = new byte[6];
+                                BinaryPrimitives.WriteUInt32BigEndian(ipBuffer, BitConverter.ToUInt32(ep.Address.GetAddressBytes()));
+                                BinaryPrimitives.WriteUInt16BigEndian(ipBuffer.AsSpan(4), (ushort) ep.Port);
+                                return new BString(ipBuffer);
+                            }
+                            else
+                            {
+                                throw new InvalidDataException("IPv6 is not supported");
+                            }
                         }
                         else if (obj is Guid)
                         {

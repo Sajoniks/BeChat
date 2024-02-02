@@ -1,10 +1,19 @@
-﻿using System.Collections;
+﻿using System.Buffers.Binary;
+using System.Collections;
 using System.Linq.Expressions;
+using System.Net;
 using System.Reflection;
 using BeChat.Bencode.Data;
 using BeChat.Bencode.Serializer;
 
 namespace BeChat.Common.Protocol;
+
+
+public sealed class NetMessageParseException : Exception
+{
+    public NetMessageParseException() { }
+    public NetMessageParseException(string s) : base(s) { }
+}
 
 public sealed class NetMessageReader : IDisposable
 {
@@ -319,6 +328,7 @@ public sealed class Request
 {
     private readonly BDict _requestBody;
     private readonly string _name;
+    private uint? _sequenceNumber;
 
     public Request(string name, BDict content)
     {
@@ -341,6 +351,11 @@ public sealed class Request
         if (_name.Length == 0) throw new ArgumentException("Name must not be empty");
         
         _requestBody = request;
+
+        if (_requestBody.ContainsKey("s"))
+        {
+            _sequenceNumber = (uint) _requestBody["s"].AsInteger();
+        }
     }
 
     public T ReadContent<T>() where T : new()
@@ -383,28 +398,55 @@ public sealed class Request
     {
         return new Response(this, e);
     }
+
+    public bool HasSequence => _sequenceNumber is not null;
+    
+    public uint Sequence
+    {
+        get => _sequenceNumber ?? throw new InvalidOperationException();
+        set
+        {
+            if (_sequenceNumber is null)
+            {
+                _sequenceNumber = value;
+                _requestBody.Add("s", value);
+            }
+            else
+            {
+                throw new InvalidOperationException();
+            }
+        }
+    }
 }
 
 [NetMessage]
 public sealed class ResponseError
 {
     [NetMessageProperty("m")]
-    public string Message { get; } = "";
+    public string Message { get; init;  } = "";
 }
+
 
 public sealed class Response
 {
     private readonly BDict _response;
     private readonly bool _error;
     private readonly string _requestName;
+    private uint? _sequenceNumber;
 
     public Response(Request request, Exception e) : this(request, e.Message)
     {}
     
     public Response(string requestName, Exception e) : this(requestName, e.Message)
     { }
+
     public Response(Request request, string errorMessage) : this(request.Name, errorMessage)
-    { }
+    {
+        if (request.HasSequence)
+        {
+            Sequence = request.Sequence;
+        }
+    }
     
     public Response(string requestName, string errorMessage)
     {
@@ -421,7 +463,38 @@ public sealed class Response
     }
 
     public Response(Request request, BDict responseBody) : this(request.Name, responseBody)
-    { }
+    {
+        if (request.HasSequence)
+        {
+            Sequence = request.Sequence;
+        }
+    }
+
+    private Response(string requestName, BDict responseBody, bool error)
+    {
+        _requestName = requestName;
+        if (_requestName.Length == 0) throw new ArgumentException("Request name must not be empty");
+        _error = error;
+
+        if (error)
+        {
+            _response = new BDict
+            {
+                { "t", "e" },
+                { "q", _requestName },
+                { "bd", responseBody }
+            };
+        }
+        else
+        {
+            _response = new BDict
+            {
+                { "t", "r" },
+                { "q", _requestName },
+                { "bd", responseBody }
+            };
+        }
+    }
     
     public Response(string requestName, BDict responseBody)
     {
@@ -447,6 +520,11 @@ public sealed class Response
             _error = true;
         }
 
+        if (response.ContainsKey("s"))
+        {
+            _sequenceNumber = (uint)response["s"].AsInteger();
+        }
+
         _response = response;
     }
 
@@ -459,20 +537,24 @@ public sealed class Response
             throw new InvalidOperationException("Error can be read only from ResponseError class");
     }
     
+    /// <exception cref="InvalidOperationException"></exception>
+    /// <exception cref="NetMessageParseException"></exception>
     public object? ReadContent(Type type)
     {
         ThrowInInvalidMessage(type);
 
-        using var reader = new NetMessageReader(_response["bd"] as BDict ?? throw new InvalidDataException("Non error response must have body"));
+        using var reader = new NetMessageReader(_response["bd"] as BDict ?? throw new NetMessageParseException("Non error response must have body"));
         var obj = NetMessage.ReadObject(type, reader);
         return obj;
     } 
     
+    /// <exception cref="InvalidOperationException"></exception>
+    /// <exception cref="NetMessageParseException"></exception>
     public T ReadContent<T>() where T : new()
     {
         ThrowInInvalidMessage(typeof(T));
         
-        using var reader = new NetMessageReader(_response["bd"] as BDict ?? throw new InvalidDataException("Non error response must have body"));
+        using var reader = new NetMessageReader(_response["bd"] as BDict ?? throw new NetMessageParseException("Non error response must have body"));
         var obj = NetMessage<T>.Read(reader);
         return obj;
     }
@@ -486,7 +568,16 @@ public sealed class Response
     {
         using var writer = new NetMessageWriter();
         NetMessage<T>.Write(msg, writer);
-        return new Response(name, writer.Data);
+        var r= new Response(name, writer.Data, typeof(T) == typeof(ResponseError));
+        return r;
+    }
+
+    public static Response CreateGenericResponse<T>(object message) where T : new()
+    {
+        using var writer = new NetMessageWriter();
+        NetMessage.WriteObject(message, writer);
+        var r = new Response(NetMessage<T>.GetMessageId(), writer.Data, typeof(T) == typeof(ResponseError));
+        return r;
     }
     
     public ResponseError ReadError()
@@ -500,6 +591,25 @@ public sealed class Response
     public byte[] GetBytes()
     {
         return _response.SerializeBytes();
+    }
+
+    public bool HasSequence => _sequenceNumber is not null;
+
+    public uint Sequence
+    {
+        get => _sequenceNumber ?? throw new InvalidOperationException();
+        set
+        {
+            if (_sequenceNumber is null)
+            {
+                _sequenceNumber = value;
+                _response.Add("s", value);
+            }
+            else
+            {
+                throw new InvalidOperationException();
+            }
+        }
     }
 }
 
@@ -584,6 +694,17 @@ public static class NetMessage
                     return false;
             }
         }
+
+        public static bool IsBool(Type t)
+        {
+            switch (Type.GetTypeCode(t))
+            {
+                case TypeCode.Boolean:
+                    return true;
+            }
+
+            return false;
+        }
     }
 
     public static string GetMessageId(Type type)
@@ -592,10 +713,18 @@ public static class NetMessage
         return attr.Id;
     }
     
+    /// <exception cref="NetMessageParseException">Thrown if failed to instantiate object of type Type</exception>
     public static object ReadObject(Type type, NetMessageReader reader)
     {
-        var inst = Activator.CreateInstance(type) ?? throw new NullReferenceException();
-        return ReadObject(inst, type, reader);
+        try
+        {
+            var inst = Activator.CreateInstance(type) ?? throw new NullReferenceException();
+            return ReadObject(inst, type, reader);
+        }
+        catch (Exception)
+        {
+            throw new NetMessageParseException();
+        }
     }
         
     public static object ReadObject(object inst, Type type, NetMessageReader reader)
@@ -642,6 +771,11 @@ public static class NetMessage
                 var val = reader.ReadInt16(propName);
                 PropertyUtility.SetPropertyValue(type, prop, inst, val);
             }
+            else if (PropertyUtility.IsBool(propType))
+            {
+                var val = reader.ReadInt16(propName) != 0;
+                PropertyUtility.SetPropertyValue(type, prop, inst, val);
+            }
             else if (propType.IsArray && (Type.GetTypeCode(propType.GetElementType()) == TypeCode.Byte))
             {
                 var bytes = reader.ReadBlob(propName);
@@ -680,26 +814,45 @@ public static class NetMessage
 
                 if (isPlainClass && propType.IsClass && propType != typeof(Delegate))
                 {
-                    var methods = propType.GetMethods(BindingFlags.Public | BindingFlags.Static);
-                    MethodInfo? deserializer = null;
-                    foreach (var method in methods)
+                    if (propType == typeof(DateTime))
                     {
-                        if (method.GetCustomAttribute<NetMessageDeserializerAttribute>() is not null)
-                        {
-                            deserializer = method;
-                            break;
-                        }
+                        var ticks = reader.ReadInt64(propName);
+                        PropertyUtility.SetPropertyValue(type, prop, inst, new DateTime(ticks));
                     }
-
-                    var propObj = reader.ReadObject(propName, propType);
-                    if (deserializer is not null)
+                    else if (propType == typeof(IPEndPoint))
                     {
-                        var bencodedObj = deserializer.Invoke(null, new[] { propObj });
-                        PropertyUtility.SetPropertyValue(type, prop, inst, bencodedObj);
+                        var bytes = reader.ReadBlob(propName);
+                        uint ip = 0;
+                        ushort port = 0;
+
+                        ip = BinaryPrimitives.ReadUInt32BigEndian(bytes);
+                        port = BinaryPrimitives.ReadUInt16BigEndian(bytes.AsSpan(4));
+                                
+                        PropertyUtility.SetPropertyValue(type, prop, inst, new IPEndPoint(ip, port));
                     }
                     else
                     {
-                        PropertyUtility.SetPropertyValue(type, prop, inst, propObj);
+                        var methods = propType.GetMethods(BindingFlags.Public | BindingFlags.Static);
+                        MethodInfo? deserializer = null;
+                        foreach (var method in methods)
+                        {
+                            if (method.GetCustomAttribute<NetMessageDeserializerAttribute>() is not null)
+                            {
+                                deserializer = method;
+                                break;
+                            }
+                        }
+
+                        var propObj = reader.ReadObject(propName, propType);
+                        if (deserializer is not null)
+                        {
+                            var bencodedObj = deserializer.Invoke(null, new[] { propObj });
+                            PropertyUtility.SetPropertyValue(type, prop, inst, bencodedObj);
+                        }
+                        else
+                        {
+                            PropertyUtility.SetPropertyValue(type, prop, inst, propObj);
+                        }
                     }
                 }
             }
@@ -756,6 +909,11 @@ public static class NetMessage
                 var val = PropertyUtility.GetPropertyValue<short>(type, prop, obj);
                 writer.WriteInt16(propName, val);
             }
+            else if (PropertyUtility.IsBool(propType))
+            {
+                var val = PropertyUtility.GetPropertyValue<bool>(type, prop, obj);
+                writer.WriteInt16(propName, val ? (short)1 : (short)0);
+            }
             else if (propType.IsArray && (Type.GetTypeCode(propType.GetElementType()) == TypeCode.Byte))
             {
                 var val = PropertyUtility.GetPropertyValue<byte[]>(type, prop, obj) ?? Array.Empty<byte>();
@@ -798,31 +956,51 @@ public static class NetMessage
 
                 if (isPlainClass && propType.IsClass && propType != typeof(Delegate))
                 {
-                    var methods = propType.GetMethods(BindingFlags.Public | BindingFlags.Static);
-                    MethodInfo? serializer = null;
-                    foreach (var method in methods)
+                    if (propType == typeof(DateTime))
                     {
-                        if (method.GetCustomAttribute<NetMessageSerializerAttribute>() is not null)
-                        {
-                            serializer = method;
-                            break;
-                        }
+                        var val = PropertyUtility.GetPropertyValue<DateTime>(type, prop, obj);
+                        writer.WriteInt64(propName, val.Ticks);
                     }
-                    
-                    var propObj = PropertyUtility.GetPropertyValue<object>(type, prop, obj);
-                    if (serializer is not null)
+                    else if (propType == typeof(IPEndPoint))
                     {
-                        var encoded = serializer.Invoke(null, new []{ propObj });
-                        if (encoded is not null)
+                        var val = PropertyUtility.GetPropertyValue<IPEndPoint>(type, prop, obj);
+                        if (val is null)
                         {
-                            writer.WriteObject(propName, encoded);
+                            val = new IPEndPoint(0, 0);
                         }
+                        var ipBuffer = new byte[6];
+                        BinaryPrimitives.WriteUInt32BigEndian(ipBuffer, BitConverter.ToUInt32(val.Address.GetAddressBytes()));
+                        BinaryPrimitives.WriteUInt16BigEndian(ipBuffer.AsSpan(4), (ushort) val.Port);
+                        writer.WriteBlob(propName, ipBuffer);
                     }
                     else
                     {
-                        if (propObj is not null)
+                        var methods = propType.GetMethods(BindingFlags.Public | BindingFlags.Static);
+                        MethodInfo? serializer = null;
+                        foreach (var method in methods)
                         {
-                            writer.WriteObject(propName, propObj);
+                            if (method.GetCustomAttribute<NetMessageSerializerAttribute>() is not null)
+                            {
+                                serializer = method;
+                                break;
+                            }
+                        }
+
+                        var propObj = PropertyUtility.GetPropertyValue<object>(type, prop, obj);
+                        if (serializer is not null)
+                        {
+                            var encoded = serializer.Invoke(null, new[] { propObj });
+                            if (encoded is not null)
+                            {
+                                writer.WriteObject(propName, encoded);
+                            }
+                        }
+                        else
+                        {
+                            if (propObj is not null)
+                            {
+                                writer.WriteObject(propName, propObj);
+                            }
                         }
                     }
                 }

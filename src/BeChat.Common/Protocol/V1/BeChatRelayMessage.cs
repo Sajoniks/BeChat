@@ -1,4 +1,5 @@
 ﻿using System.Buffers.Binary;
+using System.Net;
 using System.Text;
 using BeChat.Bencode.Data;
 
@@ -16,9 +17,42 @@ public sealed class NetMessageWelcome
 }
 
 [NetMessage("connect")]
-public sealed class NetMessageConnect
+public sealed class NetMessageConnect : NetMessageWithToken
 {
+    [NetMessageProperty("id")]
+    public Guid ConnectToId { get; init; } = Guid.Empty;
     
+    [NetMessageProperty("prip")]
+    public IPEndPoint PrivateIp { get; init; } = null!;
+    
+    [NetMessageProperty("pubip")]
+    public IPEndPoint PublicIp { get; init; } = null!;
+}
+
+[NetMessage("accept-connect")]
+public sealed class NetMessageAcceptConnect : NetMessageWithToken
+{
+    [NetMessageProperty("id")] 
+    public Guid ConnectId { get; init; } = Guid.Empty;
+    
+    [NetMessageProperty("prip")]
+    public IPEndPoint PrivateIp { get; init; } = null!;
+    
+    [NetMessageProperty("pubip")]
+    public IPEndPoint PublicIp { get; init; } = null!;
+}
+
+[NetMessage("new-accept-connect")]
+public sealed class NetNotifyAcceptConnect
+{
+    [NetMessageProperty("id")]
+    public Guid UserId { get; init; } = Guid.Empty;
+    
+    [NetMessageProperty("prip")]
+    public IPEndPoint PrivateEp { get; init; } = null!;
+    
+    [NetMessageProperty("pubip")]
+    public IPEndPoint PublicEp { get; init; } = null!;
 }
 
 public abstract class NetMessageWithToken
@@ -55,16 +89,38 @@ public class NetMessageContact
     
     [NetMessageProperty("id")]
     public Guid UserId { get; init; } = Guid.Empty;
+    
+    [NetMessageProperty("ls")]
+    public DateTime LastSeen { get; init; } = DateTime.MinValue;
+    
+    [NetMessageProperty("online")]
+    public bool IsOnline { get; init; } = false;
 }
 
 [NetMessage("new-invitation")]
 public sealed class NetNotifyNewInvitation : NetMessageContact { }
 
 [NetMessage("new-friend")]
-public sealed class NetNotifyNewFriend : NetMessageContact { }
+public sealed class NetNotifyNewFriend : NetMessageContact
+{ }
+
+[NetMessage("new-conn-request")]
+public sealed class NetNotifyConnectRequest
+{ }
+
+
+[NetMessage("online-status")]
+public sealed class NetNotifyUserOnlineStatus
+{
+    [NetMessageProperty("id")]
+    public Guid UserId { get; init; } = Guid.Empty;
+    
+    [NetMessageProperty("online")]
+    public bool IsOnline { get; init; } = false;
+}
 
 [NetMessage]
-public sealed class NetMessageFindContactsList
+public sealed class NetResponseContactsList
 {
     [NetMessageProperty("r")]
     public List<NetMessageContact> Contacts { get; init; } = new();
@@ -87,6 +143,17 @@ public sealed class NetMessageAutoLogin
     public string Token { get; init; } = "";
 }
 
+[NetMessage("get-contacts")]
+public sealed class NetMessageGetContacts : NetMessageWithToken
+{ }
+
+[NetMessage("is-online")]
+public sealed class NetMessageIsOnline : NetMessageWithToken
+{
+    [NetMessageProperty("id")]
+    public Guid UserId { get; init; } = Guid.Empty;
+}
+
 [NetMessage("register")]
 public sealed class NetMessageRegister
 {
@@ -98,7 +165,14 @@ public sealed class NetMessageRegister
 }
 
 [NetMessage]
-public sealed class NetMessageUserData
+public sealed class NetResponseIsOnline
+{
+    [NetMessageProperty("val")]
+    public bool IsOnline { get; init; }
+}
+
+[NetMessage]
+public sealed class NetContentLoginRegister
 {
     [NetMessageProperty("usr")]
     public string UserName { get; init; } = "";

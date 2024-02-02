@@ -1,7 +1,12 @@
-﻿using System.Diagnostics;
+﻿using System.Collections;
+using System.Collections.ObjectModel;
+using System.Collections.Specialized;
+using System.Diagnostics;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
+using BeChat.Common.Protocol;
+using BeChat.Common.Protocol.V1;
 using BeChat.Logging;
 using BeChat.Logging.Loggers.DebugLogger;
 using BeChat.Logging.Loggers.FileLogger;
@@ -239,22 +244,157 @@ public sealed class Bootstrap
     }
 }
 
-public sealed class BeChatApplication : IApplication, IDisposable
+public sealed class BeChatAuth : IAuthorization
 {
+    public void SetUser(IUser user)
+    {
+        _currentUser = user;
+    }
+
+    public IUser? CurrentUser => _currentUser;
+
+    private IUser? _currentUser;
+}
+
+public sealed class BeChatUser : IUser
+{
+    public Guid Id { get; }
+    public string UserName { get; }
+    public string Token { get; }
+
+    public bool IsOnline { get; set; }
+
+    public BeChatUser(Guid id, string userName, string token, bool online)
+    {
+        Id = id;
+        UserName = userName;
+        Token = token;
+        IsOnline = online;
+    }
+}
+
+public sealed class BeChatNotificationList<T> : ObservableCollection<INotification<T>>, INotificationList<T>
+{
+    public BeChatNotificationList()
+    { }
+}
+
+public sealed class BeChatContactList : ObservableCollection<IUser>, IContactList
+{
+    public BeChatContactList()
+    { }
+}
+
+public sealed class FriendRequestNotification : INotification<NetNotifyNewInvitation>
+{
+    public Guid Id { get; init;  } = Guid.Empty;
+    public NetNotifyNewInvitation Data { get; init; } = null!;
+}
+
+public sealed class ChatConnectNotification : INotification<NetNotifyAcceptConnect>
+{
+    public Guid Id { get; init;  } = Guid.Empty;
+    public NetNotifyAcceptConnect Data { get; init; } = null!;
+}
+
+public sealed class BeChatApplication : IApplication, IDisposable, IRelayMessageNotify
+{
+    public void ReceiveRelayMessage(Response response)
+    { }
+
+    [RelayMessageHandler(typeof(NetNotifyNewFriend))]
+    public void HandleNewFriend(NetNotifyNewFriend friend)
+    {
+        lock (_invitations)
+        {
+            INotification<NetNotifyNewInvitation>? invite =
+                _invitations.FirstOrDefault(x => x.Data.UserId.Equals(friend.UserId));
+            if (invite is not null)
+            {
+                _invitations.Remove(invite);
+            }
+        }
+
+        lock (_contactList)
+        {
+            _contactList.Add(new BeChatUser(id: friend.UserId, userName: friend.UserName, token: "", online: friend.IsOnline));
+        }
+    }
+
+    [RelayMessageHandler(typeof(NetNotifyNewInvitation))]
+    public void HandleNewInvitation(NetNotifyNewInvitation invitation)
+    {
+        lock (_contactList)
+        {
+            if (!_contactList.Any(x => x.Id.Equals(invitation.UserId)))
+            {
+                lock (_invitations)
+                {
+                    _invitations.Add(new FriendRequestNotification()
+                    {
+                        Data = invitation
+                    });
+                }
+            }
+        }
+    }
+
+    [RelayMessageHandler(typeof(NetNotifyUserOnlineStatus))]
+    public void HandleOnlineStatusChanged(NetNotifyUserOnlineStatus notify)
+    {
+        lock (_contactList)
+        {
+            IUser? user = _contactList.FirstOrDefault(x => x.Id.Equals(notify.UserId));
+            if (user is not null)
+            {
+                if (user.IsOnline != notify.IsOnline)
+                {
+                    user.IsOnline = notify.IsOnline;
+                    UserPresenceChange?.Invoke(this, user);
+                }
+            }
+        }
+    }
+
+    [RelayMessageHandler(typeof(NetNotifyAcceptConnect))]
+    public void HandleAcceptConnect(NetNotifyAcceptConnect accept)
+    {
+        Debug.WriteLine("Accept peer connection [From = {0}  Public = {1}  Private = {2}]", accept.UserId, accept.PublicEp, accept.PrivateEp);
+
+        _connects.Add(new ChatConnectNotification
+        {
+            Data = accept
+        });
+    }
+
+    public event EventHandler<IUser>? UserPresenceChange;
+
     private IServiceProvider? _serviceProvider;
     private ILogger? _logger;
+    private IAuthorization _authorization;
     private IConfiguration? _configuration;
     private Bootstrap? _bootstrap;
+    private IContactList _contactList;
+    private INotificationList<NetNotifyNewInvitation> _invitations;
+    private INotificationList<NetNotifyAcceptConnect> _connects;
     private RelayConnection? _relayConnection;
 
+    public IContactList ContactList => _contactList;
+    public INotificationList<NetNotifyNewInvitation> Invitations => _invitations;
+    public INotificationList<NetNotifyAcceptConnect> Connections => _connects;
     public IServiceProvider Services => _serviceProvider ?? throw new InvalidProgramException();
     public ILogger Logger => _logger ?? throw new InvalidProgramException();
+    public IAuthorization Authorization => _authorization;
     public IConfiguration Configuration => _configuration ?? throw new InvalidProgramException();
     public Bootstrap Bootstrap => _bootstrap ?? throw new InvalidProgramException();
-    public string Version => _relayConnection?.Version ?? ""
-    ;
+    public string Version => _relayConnection?.Version ?? "";
+
     private BeChatApplication()
     {
+        _authorization = new BeChatAuth();
+        _contactList = new BeChatContactList();
+        _connects = new BeChatNotificationList<NetNotifyAcceptConnect>();
+        _invitations = new BeChatNotificationList<NetNotifyNewInvitation>();
     }
 
     private static BeChatApplication? _app;
@@ -289,15 +429,36 @@ public sealed class BeChatApplication : IApplication, IDisposable
         return serviceCollection;
     }
 
-    public async Task<RelayConnection> ConnectToRelayAsync()
+    public RelayConnection CreateRelayConnection()
     {
         string hostName = _configuration?["Relay:Hostname"] ?? "";
         var hostUri = new Uri(hostName);
-
-        _relayConnection = new RelayConnection(hostUri, _logger ?? throw new InvalidProgramException());
+        var conn = new RelayConnection(hostUri, _logger ?? throw new InvalidProgramException());
+        
+        conn.AddListener<NetNotifyNewFriend>(this);
+        conn.AddListener<NetNotifyNewInvitation>(this);
+        conn.AddListener<NetNotifyUserOnlineStatus>(this);
+        conn.AddListener<NetNotifyAcceptConnect>(this);
+        
+        conn.OnDisconnect += (_, _) =>
+        {
+            _contactList.Clear();
+        };
+        
+        _relayConnection = conn;
+        return conn;
+    }
+    
+    public async Task<RelayConnection> ConnectToRelayAsync()
+    {
+        CreateRelayConnection();
+        if (_relayConnection is null) throw new InvalidProgramException();
+        
         await _relayConnection.ConnectToRelayAsync(CancellationToken.None);
         return _relayConnection;
     }
+
+    public RelayConnection? Connection => _relayConnection;
 
     private void GetRequiredServices(IServiceCollection collection)
     {

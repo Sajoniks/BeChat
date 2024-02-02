@@ -5,6 +5,7 @@ using System.Net.Sockets;
 using BeChat.Common.Protocol;
 using BeChat.Common.Protocol.V1;
 using BeChat.Relay.Data;
+using BeChat.Relay.Entites;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -80,7 +81,7 @@ public partial class Server
     private HashSet<Guid> _connectedUsers = new();
     private readonly ConnectionFactory _connectionFactory;
     private readonly ConcurrentDictionary<Guid, Queue<Response>> _perUserEventQueue = new();
-
+    private readonly ConcurrentDictionary<Guid, RequestConnectDto> _connectRequests = new();
 
     public Server(IServiceCollection collection)
     {
@@ -94,7 +95,10 @@ public partial class Server
             { NetMessage<NetMessageWelcome>.GetMessageId(), Welcome },
             { NetMessage<NetMessageFindContacts>.GetMessageId(), FindContacts },
             { NetMessage<NetMessageAddContact>.GetMessageId(), InviteToContact },
-            { NetMessage<NetMessageAcceptContact>.GetMessageId(), AcceptInviteToContact }
+            { NetMessage<NetMessageAcceptContact>.GetMessageId(), AcceptInviteToContact },
+            { NetMessage<NetMessageIsOnline>.GetMessageId(), IsOnline },
+            { NetMessage<NetMessageConnect>.GetMessageId(), Connect },
+            { NetMessage<NetMessageAcceptConnect>.GetMessageId(), AcceptConnect }
         };
         
         _provider = collection.BuildServiceProvider();
@@ -164,23 +168,67 @@ public partial class Server
                 {
                     var client = connection.Client;
 
-                    bool hasBuffer = client.Poll(1, SelectMode.SelectRead);
+                    bool hasBuffer = client.Poll(0, SelectMode.SelectRead);
                     bool hasMessages = (_userGuids.ContainsKey(client) && _perUserEventQueue.GetOrAdd(_userGuids[client], (_) => new Queue<Response>()).Any());
 
                     if (hasBuffer || hasMessages)
                     {
-                        if (hasBuffer && client.Receive(peekBuffer, SocketFlags.Peek) == 0)
+                        if (hasBuffer)
                         {
-                            _userGuids.TryRemove(client, out var guid);
-                            _perUserEventQueue.Remove(guid, out _);
-
-                            lock (_connectedUsers)
+                            try
                             {
-                                _connectedUsers.Remove(guid);
+                                int len = client.Receive(peekBuffer, SocketFlags.Peek);
+                                if (len == 0)
+                                {
+                                    throw new SocketException();
+                                }
                             }
-                            
-                            Trace.TraceInformation($"Connection lost to {client.RemoteEndPoint}");
-                            continue;
+                            catch (Exception)
+                            {
+                                _userGuids.TryRemove(client, out var guid);
+                                _perUserEventQueue.Remove(guid, out _);
+
+                                Guid g = guid;
+                                ThreadPool.QueueUserWorkItem((_) =>
+                                {
+                                    using var conn = _connectionFactory.CreateConnection();
+                                    var service = new UserData(conn);
+
+                                    try
+                                    {
+                                        IEnumerable<NetMessageContact> friends =
+                                            service.GetAllFriendsAsync(g).GetAwaiter().GetResult();
+
+                                        lock (_connectedUsers)
+                                        {
+                                            foreach (var friend in friends)
+                                            {
+                                                if (_connectedUsers.Contains(friend.UserId))
+                                                {
+                                                    var leavingQueue = GetQueue(friend.UserId);
+                                                    leavingQueue.Enqueue(Response.CreateGenericResponse(new NetNotifyUserOnlineStatus
+                                                    {
+                                                        IsOnline = false,
+                                                        UserId = g
+                                                    }));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    catch (Exception)
+                                    {
+                                        // Ignore
+                                    }
+                                });
+
+                                lock (_connectedUsers)
+                                {
+                                    _connectedUsers.Remove(guid);
+                                }
+
+                                Trace.TraceInformation($"Connection lost to {client.RemoteEndPoint}");
+                                continue;
+                            }
                         }
                         
                         ThreadPool.QueueUserWorkItem((x) =>
@@ -205,8 +253,9 @@ public partial class Server
                                     var messagesQueue = _perUserEventQueue[userId];
                                     while (messagesQueue.TryDequeue(out var response))
                                     {
-                                        Trace.TraceInformation($"Send queued message to {poolClient.RemoteEndPoint}");
-                                        poolClient.Send(response.GetBytes());
+                                        var bs = response.GetBytes();
+                                        Trace.TraceInformation($"Send queued message {response.RequestName} to {poolClient.RemoteEndPoint} [len = {bs.Length}]");
+                                        poolClient.Send(bs);
                                     }
                                 }
                             }
@@ -229,19 +278,69 @@ public partial class Server
                             {
                                 Trace.TraceError(
                                     $"Exception on client thread {Thread.CurrentThread.Name} while parsing request: {e.Message}");
+                                processedQueue.Enqueue(curConn);
+                                
                                 return;
                             }
 
                             try
                             {
-                                Trace.TraceInformation($"Request rpc {request.Name} from {poolClient.RemoteEndPoint}");
+                                if (!request.HasSequence)
+                                {
+                                    Trace.TraceInformation(
+                                        $"Request rpc {request.Name} from {poolClient.RemoteEndPoint}");
+                                }
+                                else
+                                {
+                                    Trace.TraceInformation(
+                                        $"Request rpc {request.Name} from {poolClient.RemoteEndPoint} [seq={request.Sequence}]");
+                                }
 
-                                Result result = _rpcHandlers[request.Name].Invoke(request, poolClient).Result;
+                                Result result = _rpcHandlers[request.Name].Invoke(request, poolClient).GetAwaiter().GetResult();
 
                                 var responses = result.GetResponsesArray();
                                 foreach (var r in responses)
                                 {
-                                    poolClient.Send(r.GetBytes());
+                                    if (request.HasSequence && !r.HasSequence)
+                                    {
+                                        r.Sequence = request.Sequence;
+                                    }
+
+                                    try
+                                    {
+                                        poolClient.Send(r.GetBytes());
+                                    }
+                                    catch (Exception e)
+                                    {
+                                        Trace.TraceError($"Exception on client thread {Thread.CurrentThread.Name} while sending request: {e.Message}");
+                                    }
+
+                                    if (r.HasSequence)
+                                    {
+                                        if (r.IsError)
+                                        {
+                                            Trace.TraceError(
+                                                $"Send error {request.Name} to {poolClient.RemoteEndPoint} [reason=\"{r.ReadError().Message}\"] [seq={r.Sequence}]");
+                                        }
+                                        else
+                                        {
+                                            Trace.TraceInformation(
+                                                $"Send response {request.Name} to {poolClient.RemoteEndPoint} [seq={r.Sequence}]");
+                                        }
+                                    }
+                                    else
+                                    {
+                                        if (r.IsError)
+                                        {
+                                            Trace.TraceError(
+                                                $"Send error {request.Name} to {poolClient.RemoteEndPoint} [reason=\"{r.ReadError().Message}\"]");
+                                        }
+                                        else
+                                        {
+                                            Trace.TraceInformation(
+                                                $"Send response {request.Name} to {poolClient.RemoteEndPoint}");
+                                        }
+                                    }
                                 }
                             }
                             catch (AggregateException e)

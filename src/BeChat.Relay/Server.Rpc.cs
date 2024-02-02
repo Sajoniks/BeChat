@@ -3,6 +3,7 @@ using System.Text.Json;
 using BeChat.Common.Protocol;
 using BeChat.Common.Protocol.V1;
 using BeChat.Relay.Data;
+using BeChat.Relay.Entites;
 using BeChat.Relay.Jwt;
 using JWT.Exceptions;
 
@@ -32,7 +33,7 @@ public partial class Server
         
         public void OnExpired(TokenExpiredException e)
         {
-            _error = _request.CreateError($"Token expired by {DateTime.UtcNow - e.Expiration}");
+            _error = _request.CreateError($"Token expired by {DateTime.UtcNow - e.Expiration:g}");
         }
 
         public void OnTokenInvalid(TokenNotYetValidException e)
@@ -92,6 +93,8 @@ public partial class Server
             {
                 _connectedUsers.Add(claims.UserId);
             }
+
+            await service.SetUserLastSeenAsync(claims.UserId, DateTime.UtcNow);
             
             {
                 var queue = GetQueue(claims.UserId);
@@ -100,24 +103,41 @@ public partial class Server
 
                 foreach (var invitation in invitations)
                 {
-                    queue.Enqueue(Response.CreateGenericResponse(new NetNotifyNewInvitation()
-                    {
-                        UserId = invitation.UserId,
-                        UserName = invitation.UserName
-                    }));
+                    queue.Enqueue(Response.CreateGenericResponse<NetNotifyNewInvitation>(invitation));
                 }
 
-                foreach (var friend in friends)
+                lock (_connectedUsers)
                 {
-                    queue.Enqueue(Response.CreateGenericResponse(new NetNotifyNewFriend
+                    foreach (var friend in friends)
                     {
-                        UserId = friend.UserId,
-                        UserName = friend.UserName
-                    }));
+                        queue.Enqueue(Response.CreateGenericResponse(new NetNotifyNewFriend
+                        {
+                            UserId = friend.UserId,
+                            UserName = friend.UserName,
+                            LastSeen = friend.LastSeen,
+                            IsOnline = friend.IsOnline && _connectedUsers.Contains(friend.UserId)
+                        }));
+                    
+                        queue.Enqueue(Response.CreateGenericResponse(new NetNotifyUserOnlineStatus
+                        {
+                            UserId = friend.UserId,
+                            IsOnline = friend.IsOnline && _connectedUsers.Contains(friend.UserId)
+                        }));
+                        
+                        if (_connectedUsers.Contains(friend.UserId))
+                        {
+                            var friendQueue = GetQueue(friend.UserId);
+                            friendQueue.Enqueue(Response.CreateGenericResponse(new NetNotifyUserOnlineStatus
+                            {
+                                UserId = claims.UserId,
+                                IsOnline = true
+                            }));
+                        }
+                    }
                 }
             }
                 
-            return Result.OK(request, new NetMessageUserData
+            return Result.OK(request, new NetContentLoginRegister
             {
                 Token = req.Token,
                 UserName = claims.UserName
@@ -164,6 +184,8 @@ public partial class Server
             _connectedUsers.Add(user.Id);
         }
 
+        await service.SetUserLastSeenAsync(user.Id, DateTime.UtcNow);
+        
         {
             var queue = GetQueue(user.Id);
             var invitations = await service.GetAllInvitationsAsync(user.Id);
@@ -171,30 +193,84 @@ public partial class Server
 
             foreach (var invitation in invitations)
             {
-                queue.Enqueue(Response.CreateGenericResponse(new NetNotifyNewInvitation
-                {
-                    UserId = invitation.UserId,
-                    UserName = invitation.UserName
-                }));
+                queue.Enqueue(Response.CreateGenericResponse<NetNotifyNewInvitation>(invitation));
             }
 
-            foreach (var friend in friends)
+            lock (_connectedUsers)
             {
-                queue.Enqueue(Response.CreateGenericResponse(new NetNotifyNewFriend
+                foreach (var friend in friends)
                 {
-                    UserId = friend.UserId,
-                    UserName = friend.UserName
-                }));
+                    queue.Enqueue(Response.CreateGenericResponse(new NetNotifyNewFriend
+                    {
+                        UserId = friend.UserId,
+                        UserName = friend.UserName,
+                        LastSeen = friend.LastSeen,
+                        IsOnline = friend.IsOnline && _connectedUsers.Contains(friend.UserId)
+                    }));
+                    
+                    queue.Enqueue(Response.CreateGenericResponse(new NetNotifyUserOnlineStatus
+                    {
+                        UserId = friend.UserId,
+                        IsOnline = friend.IsOnline && _connectedUsers.Contains(friend.UserId)
+                    }));
+                    
+                    if (_connectedUsers.Contains(friend.UserId))
+                    {
+                        var friendQueue = GetQueue(friend.UserId);
+                        friendQueue.Enqueue(Response.CreateGenericResponse(new NetNotifyUserOnlineStatus
+                        {
+                            UserId = user.Id,
+                            IsOnline = true
+                        }));
+                    }
+                }
             }
         }
 
-        return Result.OK(request, new NetMessageUserData
+        return Result.OK(request, new NetContentLoginRegister
         {
             UserName = req.UserName,
             Token = token
         });
     }
 
+    private async Task<Result> IsOnline(Request request, Socket socket)
+    {
+        var req = request.ReadContent<NetMessageIsOnline>();
+        
+        var exHandler = new JwtExceptionHandler(request);
+        var claims = new JwtIssuer(_configuration).Verify(req.Token, exHandler);
+
+        if (exHandler.Error is not null)
+        {
+            return Result.FromResponse(exHandler.Error);
+        }
+        
+        if (claims is null || req.UserId == Guid.Empty)
+        {
+            return Result.Exception(request, "Invalid user");
+        }
+        
+        using var conn = _connectionFactory.CreateConnection();
+        var service = new UserData(conn);
+
+        DateTime lastOnline;
+        try
+        {
+            lastOnline = await service.GetUserLastSeenAsync(req.UserId);
+        }
+        catch (UserDoesNotExistException)
+        {
+            return Result.Exception(request, "User does not exist");
+        }
+
+        bool isOnline = (DateTime.UtcNow - lastOnline) < TimeSpan.FromMinutes(1);
+        return Result.OK(request, new NetResponseIsOnline
+        {
+            IsOnline = isOnline
+        });
+    }
+    
     private async Task<Result> AcceptInviteToContact(Request request, Socket socket)
     {
         var req = request.ReadContent<NetMessageAcceptContact>();
@@ -258,6 +334,7 @@ public partial class Server
                 UserName = c1.UserName
             }));
         }
+        
 
         return Result.OK(request, new NetMessageAck());
     }
@@ -342,7 +419,7 @@ public partial class Server
 
         var contacts = await service.QueryUsersByUserNameAsync(claims.UserId, req.QueryString, 10);
         
-        return Result.OK(request, new NetMessageFindContactsList
+        return Result.OK(request, new NetResponseContactsList
         {
             Contacts = contacts.ToList()
         });
@@ -379,6 +456,8 @@ public partial class Server
             _connectedUsers.Add(newUserId);
         }
 
+        await service.SetUserLastSeenAsync(newUserId, DateTime.UtcNow);
+        
         {
             var queue = GetQueue(newUserId);
             var invitations = await service.GetAllInvitationsAsync(newUserId);
@@ -386,19 +465,168 @@ public partial class Server
 
             foreach (var invitation in invitations)
             {
-                queue.Enqueue(Response.CreateGenericResponse(invitation));
+                queue.Enqueue(Response.CreateGenericResponse<NetNotifyNewInvitation>(invitation));
             }
-
-            foreach (var friend in friends)
+            lock (_connectedUsers)
             {
-                queue.Enqueue(Response.CreateGenericResponse(friend));
+                foreach (var friend in friends)
+                {
+                    queue.Enqueue(Response.CreateGenericResponse(new NetNotifyNewFriend
+                    {
+                        UserId = friend.UserId,
+                        UserName = friend.UserName,
+                        LastSeen = friend.LastSeen,
+                        IsOnline = friend.IsOnline && _connectedUsers.Contains(friend.UserId)
+                    }));
+                    
+                    queue.Enqueue(Response.CreateGenericResponse(new NetNotifyUserOnlineStatus
+                    {
+                        UserId = friend.UserId,
+                        IsOnline = friend.IsOnline && _connectedUsers.Contains(friend.UserId)
+                    }));
+
+                    if (_connectedUsers.Contains(friend.UserId))
+                    {
+                        var friendQueue = GetQueue(friend.UserId);
+                        friendQueue.Enqueue(Response.CreateGenericResponse(new NetNotifyUserOnlineStatus
+                        {
+                            UserId = newUserId,
+                            IsOnline = true
+                        }));
+                    }
+                }
             }
         }
         
-        return Result.OK(request, new NetMessageUserData
+        return Result.OK(request, new NetContentLoginRegister
         {
             Token = token,
             UserName = req.UserName
         });
     }
+
+    private async Task<Result> Connect(Request request, Socket socket)
+    {
+        var req = request.ReadContent<NetMessageConnect>();
+        
+        var exHandler = new JwtExceptionHandler(request);
+        var claims = new JwtIssuer(_configuration).Verify(req.Token, exHandler);
+
+        if (exHandler.Error is not null)
+        {
+            return Result.FromResponse(exHandler.Error);
+        }
+
+        if (claims is null)
+        {
+            return Result.Exception(request, "Invalid user");
+        }
+
+        try
+        {
+            using var conn = _connectionFactory.CreateConnection();
+            var service = new UserData(conn);
+            await service.SetUserLastSeenAsync(claims.UserId, DateTime.UtcNow);
+        }
+        catch (Exception)
+        {
+            // ignore
+        }
+
+        if (_connectRequests.TryGetValue(req.ConnectToId, out var requestConnect))
+        {
+            {
+                var queue = GetQueue(claims.UserId);
+                queue.Enqueue(Response.CreateGenericResponse(new NetNotifyAcceptConnect
+                {
+                    UserId = requestConnect.initiatorId,
+                    PublicEp = requestConnect.publicEp,
+                    PrivateEp = requestConnect.privateEp
+                }));
+            }
+
+            {
+                var queue = GetQueue(requestConnect.initiatorId);
+                queue.Enqueue(Response.CreateGenericResponse(new NetNotifyAcceptConnect
+                {
+                    UserId = claims.UserId,
+                    PublicEp = req.PublicIp,
+                    PrivateEp = req.PrivateIp
+                }));
+            }
+            
+            return Result.OK(request, new NetMessageAck());
+        }
+        else
+        {
+            if (!_connectRequests.TryAdd(claims.UserId,
+                    new RequestConnectDto(claims.UserId, req.PrivateIp, req.PublicIp)))
+            {
+                return Result.Exception(request, "Connection is already requested");
+            }
+            else
+            {
+                return Result.OK(request, new NetMessageAck());
+            }
+        }
+    }
+
+    private async Task<Result> AcceptConnect(Request request, Socket socket)
+    {
+        var req = request.ReadContent<NetMessageAcceptConnect>();
+
+        var exHandler = new JwtExceptionHandler(request);
+        var claims = new JwtIssuer(_configuration).Verify(req.Token, exHandler);
+
+        if (exHandler.Error is not null)
+        {
+            return Result.FromResponse(exHandler.Error);
+        }
+
+        if (claims is null)
+        {
+            return Result.Exception(request, "Invalid user");
+        }
+
+        try
+        {
+            using var conn = _connectionFactory.CreateConnection();
+            var service = new UserData(conn);
+            await service.SetUserLastSeenAsync(claims.UserId, DateTime.UtcNow);
+        }
+        catch (Exception)
+        {
+            // ignore
+        }
+
+        if (_connectRequests.TryRemove(req.ConnectId, out var requestConnect))
+        {
+            {
+                var queue = GetQueue(claims.UserId);
+                queue.Enqueue(Response.CreateGenericResponse(new NetNotifyAcceptConnect
+                {
+                    UserId = requestConnect.initiatorId,
+                    PublicEp = requestConnect.publicEp,
+                    PrivateEp = requestConnect.privateEp
+                }));
+            }
+
+            {
+                var queue = GetQueue(requestConnect.initiatorId);
+                queue.Enqueue(Response.CreateGenericResponse(new NetNotifyAcceptConnect
+                {
+                    UserId = claims.UserId,
+                    PublicEp = req.PublicIp,
+                    PrivateEp = req.PrivateIp
+                }));
+            }
+            
+            return Result.OK(request, new NetMessageAck());
+        }
+        else
+        {
+            return Result.Exception(request, "Request does not exist");
+        }
+    }
+
 }

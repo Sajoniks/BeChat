@@ -22,7 +22,7 @@ public sealed class NetConnectionFactory
         _protocolId = BitConverter.ToUInt32(hash, 0) % 1000000;
     }
 
-    public NetConnection Traverse(IPEndPoint localEp, params IPEndPoint[] endPoints)
+    public Task<NetConnection> TraverseAsync(IPEndPoint localEp, params IPEndPoint[] endPoints)
     {
         if (endPoints.Length == 0)
         {
@@ -30,35 +30,55 @@ public sealed class NetConnectionFactory
         }
         
         Task[] tasks = new Task[endPoints.Length];
-        using CancellationTokenSource cts = new CancellationTokenSource();
+        CancellationTokenSource cts = new CancellationTokenSource();
         NetConnection[] connections = new NetConnection[endPoints.Length];
+        
         for (int i = 0; i < connections.Length; ++i)
         {
             connections[i] = Create();
             connections[i].Bind(localEp, true);
             int j = i;
-            tasks[i] = Task.Factory.StartNew(() => connections[j].Connect(endPoints[j]), cts.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+            tasks[i] = Task.Factory.StartNew(() => 
+                connections[j].ConnectAsync(endPoints[j], cts.Token)
+            , CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
         }
 
-        int task = Task.WaitAny(tasks);
-        NetConnection result = connections[task];
-
-        cts.Cancel();
-        Task.WaitAll(tasks);
-        
-        for (int i = 0; i < connections.Length; i++)
+        TaskCompletionSource<NetConnection> tcs = new();
+        var t = Task.WhenAny(tasks);
+        _ = t.ContinueWith(r =>
         {
-            if (i != task) connections[i].Dispose();
-        }
+            int task = Array.IndexOf(tasks, r.Result);
+            NetConnection result = connections[task];
 
-        if (!result.Connected)
-        {
-            throw new SocketException();
-        }
+            try
+            {
+                cts.Cancel();
+                Task.WaitAll(tasks);
+                cts.Dispose();
+            }
+            catch (Exception)
+            {
+                // ignore
+            }
 
-        return result;
+            for (int i = 0; i < connections.Length; i++)
+            {
+                if (i != task) connections[i].Dispose();
+            }
+
+            if (!result.Connected)
+            {
+                tcs.SetException(new SocketException());
+            }
+            else
+            {
+                tcs.SetResult(result);
+            }
+        }, CancellationToken.None);
+
+        return tcs.Task;
     }
-    
+
     public NetConnection Create()
     {
         return new NetConnection(_protocolId);

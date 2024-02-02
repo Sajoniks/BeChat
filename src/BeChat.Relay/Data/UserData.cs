@@ -48,8 +48,9 @@ public sealed class UserData : IUserData
         
         {
             await using var cmd = new NpgsqlCommand(
-                "SELECT f.user2_id, u.username FROM friends f LEFT JOIN users u ON f.user2_id=u.user_id WHERE user1_id=$1", _connection);
+                "SELECT f.user2_id, u.username, u.last_seen FROM friends f LEFT JOIN users u ON f.user2_id=u.user_id WHERE user1_id=$1", _connection);
             cmd.Parameters.AddWithValue(userId);
+            cmd.Parameters.AddWithValue(DateTime.UtcNow - TimeSpan.FromMinutes(1));
 
             await using var reader = await cmd.ExecuteReaderAsync().ConfigureAwait(false);
             while (await reader.ReadAsync().ConfigureAwait(false))
@@ -57,15 +58,18 @@ public sealed class UserData : IUserData
                 result.Add(new NetMessageContact
                 {
                     UserId = reader.GetGuid(0),
-                    UserName = reader.GetString(1)
+                    UserName = reader.GetString(1),
+                    LastSeen = reader.GetDateTime(2),
+                    IsOnline =  (reader.GetDateTime(2) >= DateTime.UtcNow - TimeSpan.FromMinutes(1))
                 });
             }
         }
         
         {
             await using var cmd = new NpgsqlCommand(
-                "SELECT f.user1_id, u.username FROM friends f LEFT JOIN users u ON f.user1_id=u.user_id WHERE user2_id=$1", _connection);
+                "SELECT f.user1_id, u.username, u.last_seen FROM friends f LEFT JOIN users u ON f.user1_id=u.user_id WHERE user2_id=$1", _connection);
             cmd.Parameters.AddWithValue(userId);
+            cmd.Parameters.AddWithValue(DateTime.UtcNow - TimeSpan.FromMinutes(1));
 
             await using var reader = await cmd.ExecuteReaderAsync().ConfigureAwait(false);
             while (await reader.ReadAsync().ConfigureAwait(false))
@@ -73,7 +77,9 @@ public sealed class UserData : IUserData
                 result.Add(new NetMessageContact
                 {
                     UserId = reader.GetGuid(0),
-                    UserName = reader.GetString(1)
+                    UserName = reader.GetString(1),
+                    LastSeen = reader.GetDateTime(2),
+                    IsOnline = (reader.GetDateTime(2) >= DateTime.UtcNow - TimeSpan.FromMinutes(1))
                 });
             }
         }
@@ -102,7 +108,7 @@ public sealed class UserData : IUserData
             return null;
         }
     }
-    
+
     public async Task<UserDto?> FindUserByUserIdAsync(Guid userId)
     {
         await using var cmd = new NpgsqlCommand("SELECT username, password FROM users WHERE user_id=$1", _connection);
@@ -155,7 +161,43 @@ public sealed class UserData : IUserData
         }
     }
 
+    public async Task<DateTime> GetUserLastSeenAsync(Guid userId)
+    {
+        using var getLastSeenCmd = new NpgsqlCommand("SELECT last_seen FROM users WHERE user_ud=$1");
+        getLastSeenCmd.Parameters.AddWithValue(userId);
 
+        try
+        {
+            object? res = await getLastSeenCmd.ExecuteScalarAsync();
+            if (res is null)
+            {
+                return DateTime.MinValue;
+            }
+
+            return (DateTime)res;
+        }
+        catch (Exception)
+        {
+            throw new UserDoesNotExistException();
+        }
+    }
+
+    public async Task SetUserLastSeenAsync(Guid userId, DateTime time)
+    {
+        using var updateLastSeenCmd = new NpgsqlCommand("UPDATE users SET last_seen=$1 WHERE user_id=$2", _connection);
+        updateLastSeenCmd.Parameters.AddWithValue(time);
+        updateLastSeenCmd.Parameters.AddWithValue(userId);
+
+        try
+        {
+            await updateLastSeenCmd.ExecuteNonQueryAsync();
+        }
+        catch (Exception)
+        {
+            // ignore
+        }
+    }
+    
     public async Task<(NetMessageContact, NetMessageContact)> AcceptInvitationAsync(Guid fromUserId, Guid toUserId)
     {
         using var getUserNamesCmd = new NpgsqlCommand(
