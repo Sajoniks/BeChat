@@ -30,9 +30,9 @@ Introduction
 
 BeChat consists from multiple projects:
 
-- A console client application, BeChat.Client. 
-- A server that supports jwt authentication, keeps track of users data and helps in connection (rendervouz in the terms of hole punching), BeChat.Relay
-- A shared libraries defining protocol and messages (BeChat.Logging, BeChat.Common, BeChat.Bencode, BeChat.Network)
+- A console client application, `BeChat.Client`. 
+- A server that supports jwt authentication, keeps track of users data and helps in connection (rendervouz in the terms of hole punching), `BeChat.Relay`
+- A shared libraries defining protocol and messages (`BeChat.Logging`, `BeChat.Common`, `BeChat.Bencode`, `BeChat.Network`)
 
 Architecture
 -----------
