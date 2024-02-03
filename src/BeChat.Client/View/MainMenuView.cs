@@ -1,6 +1,9 @@
 ﻿using System.Collections.Immutable;
 using System.Collections.ObjectModel;
+using System.Collections.Specialized;
 using BeChat.Client.ConsoleUtility;
+using BeChat.Common.Protocol.V1;
+using Microsoft.Toolkit.Uwp.Notifications;
 
 namespace BeChat.Client.View;
 

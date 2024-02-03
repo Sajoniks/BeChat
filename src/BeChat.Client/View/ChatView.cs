@@ -4,6 +4,7 @@ using System.Collections.Specialized;
 using System.Net;
 using System.Text;
 using BeChat.Client.ConsoleUtility;
+using BeChat.Common.Protocol;
 using BeChat.Common.Protocol.V1;
 using BeChat.Network;
 
@@ -22,11 +23,9 @@ public class ChatView : View
     private NetConnection? _connection;
     private ViewState _state = ViewState.Disconnected;
     private readonly ConsolePrompt _prompt;
-    private readonly Thread _sendThread;
-    private readonly Thread _recvThread;
     private readonly CancellationTokenSource _cts;
-    private List<string> _messageHistory = new();
-    private readonly ConcurrentQueue<byte[]> _messagesBuffer = new();
+    private Thread _receiverThread;
+    private List<NetNotifyChatMessage> _messageHistory = new();
     private readonly ConcurrentQueue<string> _recvMessagesBuffer = new();
     private readonly AsyncConsoleSpinner _connectSpinner;
     
@@ -35,72 +34,58 @@ public class ChatView : View
         _connectSpinner = new AsyncConsoleSpinner();
         _prompt = new ConsolePrompt(null);
         _prompt.Prompted += PromptOnPrompted;
-        _sendThread = new Thread(SenderThread);
-        _recvThread = new Thread(ReceiveThread);
+        _receiverThread = new Thread(ReceiverThread);
+        _receiverThread.Name = "ChatView Receiver Thread";
         _cts = new CancellationTokenSource();
         w.App.Connections.CollectionChanged += ConnectionsOnCollectionChanged;
     }
 
-    private void ReceiveThread()
+    private void ReceiverThread()
     {
-        if (_connection is null)
+        byte[] buffer = new byte[2048];
+        while (!_cts.IsCancellationRequested)
         {
-            throw new NullReferenceException();
-        }
-
-        var buffer = new byte[1024];
-        while (true)
-        {
-            if (_cts.IsCancellationRequested)
+            int recv;
+            try
+            {
+                recv = _connection!.Receive(buffer);
+            }
+            catch (Exception)
             {
                 return;
             }
 
+            NetNotifyChatMessage message;
             try
             {
-                int recv = _connection.Receive(buffer);
-                _recvMessagesBuffer.Enqueue(Encoding.UTF8.GetString(buffer, 0, recv));
-
-                Parent.EnqueueTask(RedrawMessages);
+                using var reader = new NetMessageReader(buffer.AsSpan(0, recv));
+                message = NetMessage<NetNotifyChatMessage>.Read(reader);
             }
             catch (Exception)
             {
-                // ignore
+                continue;
             }
+
+            Parent.EnqueueTask(() =>
+            {
+                _messageHistory.Add(message);
+                RedrawMessages();
+            });
         }
     }
     
-    private void SenderThread()
-    {
-        if (_connection is null)
-        {
-            throw new NullReferenceException();
-        }
-
-        while (true)
-        {
-            if (_cts.IsCancellationRequested)
-            {
-                return;
-            }
-
-            try
-            {
-                while (_messagesBuffer.TryDequeue(out var msg))
-                {
-                    _connection.Send(msg);
-                }
-            }
-            catch (Exception)
-            {
-                // ignore
-            }
-        }
-    }
-
     private void PromptOnPrompted(object? sender, ConsolePrompt.Result e)
     {
-        _messagesBuffer.Enqueue(Encoding.UTF8.GetBytes(e.Input));
+        NetNotifyChatMessage message = new()
+        {
+            UserId = Parent.App.Authorization.CurrentUser!.Id,
+            Content = e.Input,
+            Timestamp = DateTime.UtcNow
+        };
+        _messageHistory.Add(message);
+        _ = _connection!.SendAsync(NetMessage<NetNotifyChatMessage>.WriteBytes(message));
+        
+        RedrawMessages();
     }
 
     private void ConnectionsOnCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
@@ -116,40 +101,81 @@ public class ChatView : View
 
     private void RedrawMessages()
     {
-        while (_recvMessagesBuffer.TryDequeue(out var message))
-        {
-            _messageHistory.Add(message);
-        }
-        
         int lastIndex = _messageHistory.Count - 1;
-        int firstIndex = Math.Max(0, lastIndex - 10); // 5 messages
-        int numMessages = lastIndex - firstIndex + 1;
+        int firstIndex = Math.Max(0, lastIndex - 15);
 
-        
-        Console.SetCursorPosition(1, 1 + numMessages * 2);
-        int yBoundary = Console.CursorTop;
-        
-        while (numMessages > 0)
+        Console.CursorTop = 1;
+        for (int i = firstIndex; i <= lastIndex; ++i)
         {
-            string curMessage = _messageHistory[lastIndex];
-            Console.CursorLeft = 1;
-
-            Console.Write(new string(' ', Console.BufferWidth - 3));
-            Console.CursorTop--;
-            Console.CursorLeft = 1;
-            Console.Write(new string(' ', Console.BufferWidth - 3));
+            NetNotifyChatMessage curMessage = _messageHistory[i];
             Console.CursorLeft = 1;
             
-                
-            Console.Write(curMessage);
-            Console.CursorTop--;
-            --numMessages;
-            --lastIndex;
-        }
+            bool isOurs = false;
+            bool isSame = false;
+            
+            IUser? user = Parent.App.ContactList.FirstOrDefault(x => x.Id.Equals(curMessage.UserId));
+            if (user is null)
+            {
+                user = Parent.App.Authorization.CurrentUser!.Id.Equals(curMessage.UserId)
+                    ? Parent.App.Authorization.CurrentUser
+                    : null;
+                isOurs = true;
+            }   
+            
+            if (user is null)
+            {
+                continue;
+            }
 
-        Console.SetCursorPosition(1, yBoundary + 1);
+            if (i > 0 && _messageHistory[i - 1].UserId.Equals(user.Id))
+            {
+                isSame = true;
+            }
+
+            int yStart = Console.CursorTop;
+            Console.Write(new string(' ', Console.BufferWidth - 2));
+            Console.CursorTop++;
+            Console.CursorLeft = 1;
+            Console.Write(new string(' ', Console.BufferWidth - 2));
+            Console.CursorTop++;
+            Console.CursorLeft = 1;
+            Console.Write(new string(' ', Console.BufferWidth - 2));
+            Console.CursorTop = yStart;
+            Console.CursorLeft = 1;
+            
+            if (isOurs)
+            {
+                if (!isSame)
+                {
+                    Console.CursorLeft = Console.BufferWidth - 3 - user.UserName.Length;
+                    Console.Write('<');
+                    Console.Write(user.UserName);
+                    Console.Write('>');
+                    Console.CursorTop++;
+                }
+
+                Console.CursorLeft = Console.BufferWidth - 3 - curMessage.Content.Length;
+                Console.Write(curMessage.Content);
+                Console.CursorTop++;
+            }
+            else
+            {
+                if (!isSame)
+                {
+                    Console.CursorLeft = 1;
+                    Console.Write('<');
+                    Console.Write(user.UserName);
+                    Console.Write('>');
+                    Console.CursorTop++;
+                }
+
+                Console.CursorLeft = 2;
+                Console.Write(curMessage.Content);
+                Console.CursorTop++;
+            }
+        }
         
-        while (Console.CursorTop != Console.WindowHeight - 1)
+        while (Console.CursorTop < Console.WindowHeight - 2)
         {
             Console.CursorLeft = 1;
             Console.Write(new string(' ', Console.BufferWidth - 3));
@@ -164,7 +190,6 @@ public class ChatView : View
             _state = ViewState.WaitingForConnection;
         }
     }
-
     private void EndConnect(NetConnection connection)
     {
         _connection = connection;
@@ -180,8 +205,7 @@ public class ChatView : View
     private void ShowDialogueWindow()
     {
         _cts.TryReset();
-        _sendThread.Start();
-        _recvThread.Start();
+        _receiverThread.Start();
         
         _connectSpinner.Stop(clear: true);
         
@@ -246,7 +270,7 @@ public class ChatView : View
         {
             var connectionTask = NetConnectionFactory.Default.TraverseAsync(
                 new IPEndPoint(bootstrap.PrivateIps.First(), bootstrap.PublicEndPoints.First().Port), 
-                connect.PrivateEp,
+                // connect.PrivateEp,
                 connect.PublicEp
             );
             connectionTask.ContinueWith(EndConnectTaskCompleted);
@@ -277,8 +301,7 @@ public class ChatView : View
         _prompt.Close();
         
         _cts.Cancel();
-        _sendThread.Join();
-        _recvThread.Join();
+        _receiverThread.Join();
         
         Console.SetCursorPosition(0, 0);
     }

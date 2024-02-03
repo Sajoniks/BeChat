@@ -130,7 +130,7 @@ public class LoginView : View
                     WriteTokenToFile(ct.Token);
                     
                     Parent.App.Authorization.SetUser(new BeChatUser(
-                        id: Guid.Empty, 
+                        id: ct.UserId,
                         userName: ct.UserName,
                         token: ct.Token,
                         online: true
@@ -292,7 +292,7 @@ public class LoginView : View
                             }
 
                             Parent.App.Authorization.SetUser(new BeChatUser(
-                                id: Guid.Empty, 
+                                id: ct.UserId,
                                 userName: ct.UserName,
                                 token: ct.Token,
                                 online: true
