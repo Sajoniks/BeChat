@@ -1,6 +1,7 @@
 BeChat
 =================================================
 
+```
 +------------------------------------------+
 |                                          |
 |       ____       ________          __    |
@@ -10,6 +11,7 @@ BeChat
 |   /_____/\___/\____/_/ /_/\__,_/\__/     |
 |                                          |
 +------------------------------------------+
+```
         
 BeChat is a my proof-of-concept implementation of Peer-To-Peer chat application. It includes rendervouz server, UDP hole punching and a console client application.
 
@@ -18,8 +20,10 @@ Table of contents
 -----------------
 
 * [Introduction](#introduction)
+* [Architecture](#introduction)
 * [Features](#features)
 * [Roadmap](#roadmap)
+* [References](#roadmap)
 
 Introduction
 ------------
