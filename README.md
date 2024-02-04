@@ -59,18 +59,21 @@ References
 ------------
 
 ### Bencode encoding
-------------
 
 [BEncode specification](https://wiki.theory.org/BitTorrentSpecification#Bencoding)
 
-### Reliable data transfer over UDP
 ------------
+
+### Reliable data transfer over UDP
+
 - [Automatic repeat requests](https://en.wikipedia.org/wiki/Automatic_repeat_request)
 - [Selective repeat protocol](https://en.wikipedia.org/wiki/Selective_Repeat_ARQ)
 - [Virtual connection over UDP](https://gafferongames.com/post/virtual_connection_over_udp/)
 - [Reliable UDP protocol](https://hackernoon.com/unity-realtime-multiplayer-part-3-reliable-udp-protocol)
 
+------------
 
 ### P2P connectivity
-------------
 [Peer-to-Peer Communication Across Network Address Translators](https://bford.info/pub/net/p2pnat/index.html)
+
+------------
