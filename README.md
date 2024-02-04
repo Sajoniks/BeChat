@@ -73,6 +73,13 @@ References
 
 ------------
 
+### Encryption
+
+- [Elliptic Diffie-Hellman key exchange protocol](https://cryptobook.nakov.com/asymmetric-key-ciphers/ecdh-key-exchange)
+- [Elliptic curve cryptography](https://cryptobook.nakov.com/asymmetric-key-ciphers/elliptic-curve-cryptography-ecc)
+
+------------
+
 ### P2P connectivity
 [Peer-to-Peer Communication Across Network Address Translators](https://bford.info/pub/net/p2pnat/index.html)
 
