@@ -140,6 +140,7 @@ public partial class Server
             return Result.OK(request, new NetContentLoginRegister
             {
                 Token = req.Token,
+                UserId = claims.UserId,
                 UserName = claims.UserName
             });
         }
@@ -230,6 +231,7 @@ public partial class Server
         return Result.OK(request, new NetContentLoginRegister
         {
             UserName = req.UserName,
+            UserId = user.Id,
             Token = token
         });
     }
@@ -501,6 +503,7 @@ public partial class Server
         return Result.OK(request, new NetContentLoginRegister
         {
             Token = token,
+            UserId = newUserId,
             UserName = req.UserName
         });
     }

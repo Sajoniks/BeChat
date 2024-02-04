@@ -1,12 +1,11 @@
 ﻿using System.Buffers;
 using System.Buffers.Binary;
 using System.Diagnostics;
-using System.IO.Hashing;
 using System.Net;
 using System.Net.Sockets;
 using System.Timers;
 using NSec.Cryptography;
-using Timer = System.Timers.Timer;
+using Timer = System.Threading.Timer;
 
 namespace BeChat.Network;
 
@@ -22,7 +21,8 @@ public sealed class NetConnection : IDisposable
         Seq,
         Enk,
         EnkAck,
-        Ack
+        Ack,
+        KeepAlive
     }
 
     struct Header
@@ -198,12 +198,20 @@ public sealed class NetConnection : IDisposable
     public Socket Socket => _socket;
     
     private readonly int _windowSize = 5;
-    private readonly System.Timers.Timer _ackTimer;
+
+    private readonly Thread _socketThread;
+    private readonly System.Timers.Timer _timer;
+    private readonly System.Timers.Timer _keepAliveTimer;
+    
     private readonly Window _sendWindow;
     private readonly Window _recvWindow;
 
     private readonly Dictionary<uint, BufferedPacket> _bufferedInPackets = new();
-    private readonly Dictionary<uint, BufferedPacket> _bufferdOutPackets = new();
+    private readonly Dictionary<uint, BufferedPacket> _bufferedOutPackets = new();
+    private readonly Queue<Memory<byte>> _packets = new();
+    private readonly ManualResetEventSlim _packetsAvailableResetEvent = new();
+
+    private long _lastPacketTimeReceived = 0;
     
     private readonly byte[] _recvBuffer = new byte[16 * 1024 * 1024];
     private int _recvPos = 0;
@@ -211,7 +219,6 @@ public sealed class NetConnection : IDisposable
     private int _sendPos = 0;
     
     private bool _disposed = false;
-    private volatile bool _timeout = false;
 
     private Key? _key;
     private SharedSecret? _secret;
@@ -220,25 +227,275 @@ public sealed class NetConnection : IDisposable
     public NetConnection(uint protocolId)
     {
         _protocolId = protocolId;
+        _socketThread = new Thread(SocketReceiveThread);
+        _socketThread.Name = "Net Connection Thread";
+        
+        _timer = new System.Timers.Timer();
+        _timer.Interval = 1000;
+        _timer.AutoReset = false;
+        _timer.Elapsed += OnTimeout;
+
+        _keepAliveTimer = new System.Timers.Timer();
+        _keepAliveTimer.Interval = 2000;
+        _keepAliveTimer.AutoReset = true;
+        _keepAliveTimer.Elapsed += KeepAliveTimerOnElapsed;
         
         _sendWindow = new Window(Window.Mode.Sender, _windowSize);
         _recvWindow = new Window(Window.Mode.Receiver, _windowSize);
         
-        _ackTimer = new System.Timers.Timer();
-        _ackTimer.Elapsed += AckTimerTimeout;
-        _ackTimer.Interval = 1000;
-        
         _socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
     }
 
-    private void AckTimerTimeout(object? source, ElapsedEventArgs args)
+    private void KeepAliveTimerOnElapsed(object? sender, ElapsedEventArgs e)
+    {
+        if (_remoteEp is null)
+        {
+            return;
+        }
+
+        var h = new Header
+        {
+            ProtocolId = _protocolId,
+            PacketType = PacketType.KeepAlive,
+            PacketId = _sendWindow.NextPacketId
+        };
+        
+        Send(h, new byte[1]);
+        
+        Debug.WriteLine("NetConnection sent keep-alive packet [{0} => {1}]", LocalEndPoint, RemoteEndPoint);
+    }
+
+    private void OnTimeout(object? sender, ElapsedEventArgs e)
     {
         if (_remoteEp is null)
         {
             throw new SocketException();
         }
+        
+        lock (_sendBuffer)
+        {
+            foreach (uint packetId in _sendWindow.OutstandingPackets)
+            {
+                if (_bufferedOutPackets.TryGetValue(packetId, out var packet))
+                {
+                    _socket.SendTo(_sendBuffer, packet.Data.Offset, packet.Data.Count, SocketFlags.None, _remoteEp);
+                }
+            }
 
-        _timeout = true;
+            if (_bufferedOutPackets.Count > 0)
+            {
+                _timer.Start();
+            }
+        }
+    }
+
+    private void DisconnectFromReceiveThread()
+    {
+        Debug.WriteLine("Connection time-out");
+
+        _connected = false;
+        _socket.Dispose();
+
+        _keepAliveTimer.Dispose();
+        _timer.Dispose();
+    }
+
+    private void SocketReceiveThread()
+    {
+        if (_remoteEp is null || !_connected || _secret is null)
+        {
+            Debug.WriteLine("Stopping thread {0} due connection is not established", Thread.CurrentThread.Name);
+        }
+        
+        EndPoint ep = new IPEndPoint(0, 0);
+        while (_connected)
+        {
+            if (!_socket.Poll(0, SelectMode.SelectRead))
+            {
+                var lastTime = new DateTime(_lastPacketTimeReceived);
+                var timespan = TimeSpan.FromSeconds(10);
+                if (Debugger.IsAttached)
+                {
+                    timespan = TimeSpan.FromDays(1);
+                }
+                
+                if (DateTime.UtcNow - lastTime > timespan)
+                {
+                    DisconnectFromReceiveThread();
+                    return;
+                }
+                
+                continue;
+            }
+
+            int recvPacketLen = 0;
+            try
+            {
+                recvPacketLen = _socket.ReceiveFrom(_recvBuffer, _recvPos, _recvBuffer.Length - _recvPos, SocketFlags.None, ref ep);
+                if (!ep.Equals(_remoteEp))
+                {
+                    continue;
+                }
+            }
+            catch (Exception)
+            {
+                continue;
+            }
+
+            _lastPacketTimeReceived = DateTime.UtcNow.Ticks;
+
+            if (recvPacketLen >= Header.HeaderSize)
+            {
+                int curRecvPos = _recvPos;
+                
+                Header h;
+                try
+                {
+                    h = new Header(_recvBuffer.AsSpan(curRecvPos));
+                    if (h.ProtocolId != _protocolId)
+                    {
+                        continue;
+                    }
+                    curRecvPos += Header.HeaderSize;
+                    recvPacketLen -= Header.HeaderSize;
+                }
+                catch (Exception)
+                {
+                    continue;
+                }
+
+                switch (h.PacketType)
+                {
+                    case PacketType.Seq:
+                    case PacketType.KeepAlive:
+                        {
+                            lock (_recvWindow)
+                            {
+                                Debug.WriteLine("NetConnection packet [type = {0}  src = {1}  len = {2}]",
+                                    h.PacketType, 
+                                    _remoteEp,
+                                    recvPacketLen  
+                                );
+                                
+                                int availablePackets = 0;
+                                if (_recvWindow.IsInWindow(h.PacketId))
+                                {
+                                    var segment = new ArraySegment<byte>(_recvBuffer, curRecvPos, recvPacketLen);
+                                    var packet = new BufferedPacket(segment, h);
+                                    _bufferedInPackets[h.PacketId] = packet;
+                                    availablePackets = _recvWindow.Put(h.PacketId);
+                                }
+
+                                int prevPacketsNum;
+                                int newPacketsNum;
+                                lock (_packets)
+                                {
+                                    prevPacketsNum = _packets.Count;
+                                    
+                                    if (availablePackets > 0)
+                                    {
+                                        // @todo
+                                        using var key = KeyDerivationAlgorithm.HkdfSha256.DeriveKey(_secret,
+                                            ReadOnlySpan<byte>.Empty, new byte[12], AeadAlgorithm.Aes256Gcm);
+                                        while (_recvWindow.AvailablePackets.TryDequeue(out var packetId))
+                                        {
+                                            if (_bufferedInPackets.Remove(packetId, out var packet))
+                                            {
+                                                Span<byte> cipherPacket =
+                                                    _recvBuffer.AsSpan(packet.Data.Offset, packet.Data.Count);
+                                                
+                                                byte[]? content = AeadAlgorithm.Aes256Gcm.Decrypt(key, new byte[12],
+                                                    new byte[12], cipherPacket);
+                                                Array.Fill(_recvBuffer, Byte.MinValue, packet.Data.Offset,
+                                                    packet.Data.Count);
+
+                                                if (packet.Data.Offset + packet.Data.Count == _recvPos)
+                                                {
+                                                    // we have reached end of the buffer
+                                                    _recvPos = 0;
+                                                }
+
+                                                if (content is null)
+                                                {
+                                                    continue;
+                                                }
+
+                                                if (h.PacketType != PacketType.KeepAlive)
+                                                {
+                                                    _packets.Enqueue(content);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    
+                                    newPacketsNum = _packets.Count;
+                                }
+
+                                if (prevPacketsNum != newPacketsNum && prevPacketsNum == 0)
+                                {
+                                    _packetsAvailableResetEvent.Set();
+                                }
+                            }
+                            
+                            // send ack
+                            
+                            var ackHeader = new Header
+                            {
+                                ProtocolId = _protocolId,
+                                Ack = h.PacketId,
+                                PacketId = h.PacketId,
+                                PacketType = PacketType.Ack
+                            };
+
+                            try
+                            {
+                                using var ackMemoryStream = new MemoryStream(new byte[Header.HeaderSize]);
+                                ackHeader.WriteBytes(ackMemoryStream);
+                                _socket.SendTo(ackMemoryStream.ToArray(), Header.HeaderSize, SocketFlags.None, _remoteEp);
+                            }
+                            catch (Exception)
+                            {
+                                continue;
+                            }
+                        }
+                        break;
+
+                    case PacketType.Ack:
+                        {
+                            lock (_sendBuffer)
+                            {
+                                if (_sendWindow.IsInWindow(h.Ack))
+                                {
+                                    int available = _sendWindow.Put(h.Ack);
+                                    if (available > 0)
+                                    {
+                                        while (_sendWindow.AvailablePackets.TryDequeue(out uint packetId))
+                                        {
+                                            if (_bufferedOutPackets.Remove(packetId, out var packet))
+                                            {
+                                                Array.Fill(_sendBuffer, Byte.MinValue, packet.Data.Offset,
+                                                    packet.Data.Count);
+                                                if (packet.Data.Offset + packet.Data.Count == _sendPos)
+                                                {
+                                                    // we have reached end of the send buffer
+                                                    _sendPos = 0;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if (_bufferedOutPackets.Count == 0)
+                                {
+                                    _timer.Stop();
+                                    _timer.Start();
+                                }
+                            }
+                        }
+                        break;
+                }
+            }
+        }
     }
 
     public void Bind(IPEndPoint endPoint, bool reuseSocket = false)
@@ -265,8 +522,8 @@ public sealed class NetConnection : IDisposable
         byte[] keyBuffer = Array.Empty<byte>();
 
         bool retryPacket = false;
-        
-        Timer timer = new Timer();
+
+        System.Timers.Timer timer = new();
         timer.Interval = 2000;
         timer.AutoReset = true;
         timer.Elapsed += (_, _) =>
@@ -380,6 +637,8 @@ public sealed class NetConnection : IDisposable
             return;
         }
 
+        _lastPacketTimeReceived = DateTime.UtcNow.Ticks;
+        
         while (!connectionEstablished)
         {
             token.ThrowIfCancellationRequested();
@@ -411,6 +670,7 @@ public sealed class NetConnection : IDisposable
 
             if (!_socket.Poll(0, SelectMode.SelectRead))
             {
+                var lastTime = new DateTime(_lastPacketTimeReceived);
                 continue;
             }
 
@@ -424,6 +684,8 @@ public sealed class NetConnection : IDisposable
 
                 recvPktLen = result.ReceivedBytes;
                 recvFromEp = result.RemoteEndPoint;
+
+                Debug.WriteLine("NetConnection received packet [{0} <- {1}]", LocalEndPoint, recvFromEp);
             }
             catch (Exception e)
             {
@@ -433,8 +695,11 @@ public sealed class NetConnection : IDisposable
 
             if (!recvFromEp.Equals(endPoint))
             {
+                Debug.WriteLine("NetConnection mismatch packet srt [{0}, expected {1}]", recvFromEp, endPoint);
                 continue;
             }
+
+            _lastPacketTimeReceived = DateTime.UtcNow.Ticks;
             
             if (recvPktLen == sizeof(UInt32)) // protocol received
             {
@@ -583,227 +848,231 @@ public sealed class NetConnection : IDisposable
         {
             _remoteEp = endPoint;
             _connected = true;
+            _socketThread.Start();
+            _keepAliveTimer.Start();
         }
     }
 
-    public int Receive(byte[] buffer)
+    private int ReceivePacket(Memory<byte> dest)
     {
-        if (_remoteEp is null || !_connected)
+        int packetLen = 0;
+        lock (_packets)
         {
-            throw new SocketException();
+            if (_packets.TryDequeue(out var packet))
+            {
+                packet.CopyTo(dest);
+                packetLen = packet.Length;
+            }
+
+            if (_packets.Count == 0)
+            {
+                _packetsAvailableResetEvent.Reset();
+            }
         }
 
-        byte[] peek = new byte[1];
-        while (true)
+        return packetLen;
+    }
+
+    public int Receive(Memory<byte> buffer)
+    {
+        _packetsAvailableResetEvent.Wait();
+
+        lock (_packets)
         {
-            if (_timeout)
+            int packetLen = 0;
+            if (_packets.TryDequeue(out var packet))
             {
-                foreach (var outstandingPacketId in _sendWindow.OutstandingPackets)
-                {
-                    BufferedPacket outstandingPacket = _bufferdOutPackets[outstandingPacketId];
-                    byte[] curPktData = outstandingPacket.Data.Array!;
-                    _socket.SendTo(curPktData, outstandingPacket.Data.Offset, outstandingPacket.Data.Count, SocketFlags.None, _remoteEp);
-            
-                    // Console.WriteLine($"[{Thread.CurrentThread.Name}] Sent packet {outstandingPacketId} to {_remoteEp} because of timeout");
-                }
-                _timeout = false;
-                _ackTimer.Stop();
-                _ackTimer.Start();
-            }
-            
-            if (!_socket.Poll(150, SelectMode.SelectRead))
-            {
-                continue;
+                packetLen = packet.Length;
+                packet.CopyTo(buffer);
             }
 
-            EndPoint ep = new IPEndPoint(IPAddress.Any, 0);
-            int recvBytes = _socket.ReceiveFrom(_recvBuffer, _recvPos, _recvBuffer.Length - _recvPos, SocketFlags.None, ref ep);
-            int totalRecvBytes = 0;
-            
-            if (recvBytes >= Header.HeaderSize && ep.Equals(_remoteEp))
+            if (_packets.Count == 0)
             {
-                var header = new Header(_recvBuffer.AsSpan(_recvPos, Header.HeaderSize));
+                _packetsAvailableResetEvent.Reset();
+            }
+            
+            return packetLen;
+        }
+    }
+
+    public Task<int> ReceiveAsync(Memory<byte> buffer, CancellationToken token = default)
+    {
+        if (_packetsAvailableResetEvent.IsSet)
+        {
+            return Task.FromResult(ReceivePacket(buffer));
+        }
+        else
+        {
+            var tcs = new TaskCompletionSource<int>();
+            CancellationTokenRegistration ctr = token.Register(() =>
+            {
+                tcs.TrySetCanceled();
+            });
+            
+            RegisteredWaitHandle h = ThreadPool.RegisterWaitForSingleObject(_packetsAvailableResetEvent.WaitHandle, (_, _) =>
+            {
+                tcs.TrySetResult(ReceivePacket(buffer));
+            }, null, -1, executeOnlyOnce: true);
+
+            _ = tcs.Task.ContinueWith(_ =>
+            {
+                h.Unregister(null);
+                ctr.Unregister();
                 
-                if (header.ProtocolId == _protocolId)
-                {
-                    int startRecvPos = _recvPos;
-                    _recvPos += recvBytes;
-                    
-                    switch (header.PacketType)
-                    {
-                        case PacketType.Seq:
-                        {
-                            if (_recvWindow.IsInWindow(header.PacketId))
-                            {
-                                // Console.WriteLine($"[{Thread.CurrentThread.Name}] Received {header.PacketType} {header.PacketId} {_remoteEp} => {LocalEndPoint}");
-                                
-                                var segment = new ArraySegment<byte>(_recvBuffer, startRecvPos, recvBytes);
-                                var bufferedPacket = new BufferedPacket(segment, header);
-                                _bufferedInPackets[header.PacketId] = bufferedPacket;
-                                
-                                int available = _recvWindow.Put(header.PacketId);
-                                if (available > 0)
-                                {
-                                    using var key = KeyDerivationAlgorithm.HkdfSha256.DeriveKey(_secret, ReadOnlySpan<byte>.Empty, 
-                                        new byte[12], AeadAlgorithm.Aes256Gcm);
-                                    
-                                    int writePos = 0;
-                                    int realWritePos = 0;
-                                    while (_recvWindow.AvailablePackets.TryDequeue(out uint bufferedPacketId))
-                                    {
-                                        BufferedPacket curPkt = _bufferedInPackets[bufferedPacketId];
-                                        _bufferedInPackets.Remove(bufferedPacketId);
-                                        
-                                        var curPktData = curPkt.Data.Array!;
-                                        var content = AeadAlgorithm.Aes256Gcm.Decrypt(key, new byte[12], new byte[12], curPktData.AsSpan(Header.HeaderSize, curPkt.Data.Count - Header.HeaderSize));
+            }, CancellationToken.None);
 
-                                        Array.Copy(content, 0, buffer, writePos, content.Length);
-                                        Array.Fill(_recvBuffer, Byte.MinValue, curPkt.Data.Offset, curPkt.Data.Count);
-
-                                        writePos += content.Length;
-                                        realWritePos += curPkt.Data.Count;
-                                    }
-
-                                    totalRecvBytes = writePos;
-                                    _recvPos -= realWritePos;
-                                }
-                            }
-                            
-                            // send ack
-                            {
-                                var ackHeader = new Header
-                                {
-                                    ProtocolId = _protocolId,
-                                    Ack = header.PacketId,
-                                    PacketId = header.PacketId,
-                                    PacketType = PacketType.Ack
-                                };
-
-                                using var ackMemoryStream = new MemoryStream();
-                                ackHeader.WriteBytes(ackMemoryStream);
-
-                                _socket.SendTo(ackMemoryStream.ToArray(), Header.HeaderSize, SocketFlags.None, _remoteEp);
-                                
-                                // Console.WriteLine($"[{Thread.CurrentThread.Name}] Sent {ackHeader.PacketType} {ackHeader.PacketId} {LocalEndPoint} => {_remoteEp}");
-                            }
-                        }
-                        break;
-
-                        case PacketType.Ack:
-                        {
-                            if (_sendWindow.IsInWindow(header.Ack))
-                            {
-                                // Console.WriteLine($"[{Thread.CurrentThread.Name}] Ack {header.Ack} accepted {_remoteEp} => {LocalEndPoint}");
-
-                                int available = _sendWindow.Put(header.Ack);
-                                if (available > 0)
-                                {
-                                    while (_sendWindow.AvailablePackets.TryDequeue(out uint packetId))
-                                    {
-                                        BufferedPacket curPkt = _bufferdOutPackets[packetId];
-                                        _bufferdOutPackets.Remove(packetId);
-                                        
-                                        Array.Fill(_sendBuffer, Byte.MinValue, curPkt.Data.Offset, curPkt.Data.Count);
-                                    }
-                                }
-                            }
-                            else
-                            {
-                                // Console.WriteLine($"[{Thread.CurrentThread.Name}] Ack {header.Ack} ignored {_remoteEp} => {LocalEndPoint}");
-                            }
-
-                            if (_sendWindow.IsEmpty)
-                            {
-                                _ackTimer.Stop();
-                            }
-                        } 
-                        break;
-                    }
-                }
-                else
-                {
-                    Array.Fill(_recvBuffer, Byte.MinValue, _recvPos, recvBytes);
-                }
-
-                if (totalRecvBytes > 0)
-                {
-                    return totalRecvBytes;
-                }
-            }
+            return tcs.Task;
         }
     }
 
-    public int Send(ReadOnlySpan<byte> buffer)
+    /// <exception cref="OverflowException"></exception>
+    public async Task<int> SendAsync(ReadOnlyMemory<byte> buffer, CancellationToken token = default)
     {
-        if (_remoteEp is null)
+        if (!_connected || _remoteEp is null)
         {
             throw new SocketException();
         }
+        
+        using Key key = KeyDerivationAlgorithm.HkdfSha256.DeriveKey(_secret!, ReadOnlySpan<byte>.Empty, new byte[12],
+            AeadAlgorithm.Aes256Gcm);
 
-        int packetTotalSize = Header.HeaderSize + buffer.Length;
-        if (packetTotalSize > _sendBuffer.Length)
+        byte[] packetContent = AeadAlgorithm.Aes256Gcm.Encrypt(key, new byte[12], new byte[12], buffer.Span);
+        if (packetContent.Length == 0)
+        {
+            return 0;
+        }
+
+        int packetLen = Header.HeaderSize + packetContent.Length;
+        if (packetLen > _sendBuffer.Length - _sendPos)
         {
             throw new OverflowException();
         }
 
-        int send = 0;
-        var header = new Header
+        bool send = false;
+        int sentLen = 0;
+        ArraySegment<byte> segment;
+
+        lock (_sendBuffer)
+        {
+            var h = new Header
+            {
+                ProtocolId = _protocolId,
+                PacketType = PacketType.Seq,
+                PacketId = _sendWindow.NextPacketId
+            };
+            using var packetStream = new MemoryStream(_sendBuffer, _sendPos, packetLen);
+            h.WriteBytes(packetStream);
+            packetStream.Write(packetContent);
+            _sendPos += packetLen;
+
+
+            segment = new ArraySegment<byte>(_sendBuffer, _sendPos - packetLen, packetLen);
+
+            if (!_sendWindow.IsBlocked)
+            {
+                _sendWindow.Push();
+
+                _timer.Stop();
+                _timer.Start();
+
+                send = true;
+            }
+            
+            var packet = new BufferedPacket(segment, h);
+            _bufferedOutPackets[h.PacketId] = packet;
+        }
+
+        if (send)
+        {
+            sentLen = await _socket.SendToAsync(segment, SocketFlags.None, _remoteEp).ConfigureAwait(false);
+        }
+
+        return sentLen;
+    }
+
+    private int Send(Header h, ReadOnlyMemory<byte> buffer)
+    {
+        if (!_connected || _remoteEp is null)
+        {
+            throw new SocketException();
+        }
+        
+        using Key key = KeyDerivationAlgorithm.HkdfSha256.DeriveKey(_secret!, ReadOnlySpan<byte>.Empty, new byte[12],
+            AeadAlgorithm.Aes256Gcm);
+
+        byte[] packetContent = AeadAlgorithm.Aes256Gcm.Encrypt(key, new byte[12], new byte[12], buffer.Span);
+        if (packetContent.Length == 0)
+        {
+            return 0;
+        }
+
+        int packetLen = Header.HeaderSize + packetContent.Length;
+        if (packetLen > _sendBuffer.Length - _sendPos)
+        {
+            throw new OverflowException();
+        }
+        
+        bool send = false;
+        int sentLen = 0;
+        ArraySegment<byte> segment;
+        
+        lock (_sendBuffer)
+        {
+            using var packetStream = new MemoryStream(_sendBuffer, _sendPos, packetLen);
+            h.WriteBytes(packetStream);
+            packetStream.Write(packetContent);
+            _sendPos += packetLen;
+
+            segment = new ArraySegment<byte>(_sendBuffer, _sendPos - packetLen, packetLen);
+
+            if (!_sendWindow.IsBlocked)
+            {
+                _sendWindow.Push();
+
+                _timer.Stop();
+                _timer.Start();
+
+                send = true;
+            }
+            
+            var packet = new BufferedPacket(segment, h);
+            _bufferedOutPackets[h.PacketId] = packet;
+        }
+        
+        if (send)
+        {
+            sentLen = _socket.SendTo(segment, SocketFlags.None, _remoteEp);
+        }
+
+        return sentLen;
+    }
+    
+    public int Send(ReadOnlyMemory<byte> buffer)
+    {
+        var h = new Header
         {
             ProtocolId = _protocolId,
             PacketType = PacketType.Seq,
             PacketId = _sendWindow.NextPacketId
         };
-
-        using var memoryStream = new MemoryStream(_sendBuffer, _sendPos, _sendBuffer.Length - _sendPos);
-        header.WriteBytes(memoryStream);
-
-        using var key = KeyDerivationAlgorithm.HkdfSha256.DeriveKey(_secret, ReadOnlySpan<byte>.Empty, new byte[12],
-            AeadAlgorithm.Aes256Gcm);
-
-        var content = AeadAlgorithm.Aes256Gcm.Encrypt(key, new byte[12], new byte[12], buffer);
-        memoryStream.Write(content);
-        
-        
-        int lastSendPos = _sendPos;
-        int realPacketSize = content.Length + Header.HeaderSize;
-        
-        if (!_sendWindow.IsBlocked)
-        {
-            send = _socket.SendTo(_sendBuffer, _sendPos, realPacketSize, SocketFlags.None, _remoteEp);
-            if (send > 0)
-            {
-                _sendWindow.Push();
-                _sendPos += realPacketSize;
-                
-                // Console.WriteLine($"[{Thread.CurrentThread.Name}] Send {header.PacketType} {header.PacketId} {LocalEndPoint} => {_remoteEp}");
-
-                // reset ack timer
-                _ackTimer.Stop();
-                _ackTimer.Start();
-            }
-            else
-            {
-                Array.Fill(_sendBuffer, Byte.MinValue, _sendPos, realPacketSize);
-            }
-        }
-
-        if (send > 0)
-        {
-            // buffer it
-            var segment = new ArraySegment<byte>(_sendBuffer, lastSendPos, realPacketSize);
-            var bufferedPacket = new BufferedPacket(segment, header);
-            _bufferdOutPackets[header.PacketId] = bufferedPacket;
-        }
-
-        return send;
+        return Send(h, buffer);
     }
 
     public void Dispose()
     {
         if (!_disposed)
         {
-            _socket.Dispose();
             _disposed = true;
+
+            if (_connected)
+            {
+                _connected = false;
+                _socketThread.Join();
+            }
+            
+            _timer.Dispose();
+            _keepAliveTimer.Dispose();
+            _socket.Dispose();
         }
     }
 }

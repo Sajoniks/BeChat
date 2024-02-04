@@ -177,6 +177,9 @@ public sealed class NetContentLoginRegister
     [NetMessageProperty("usr")]
     public string UserName { get; init; } = "";
     
+    [NetMessageProperty("id")]
+    public Guid UserId { get; init; } = Guid.Empty;
+    
     [NetMessageProperty("tok")]
     public string Token { get; init;  } = "";
 }

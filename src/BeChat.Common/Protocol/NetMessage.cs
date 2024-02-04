@@ -277,6 +277,8 @@ public sealed class NetMessageWriter : IDisposable
     }
 
     public BDict Data => _source;
+
+    public byte[] GetBytes() => Data.SerializeBytes();
     
     public void Dispose()
     {
@@ -1031,6 +1033,14 @@ public static class NetMessage<T> where T : new()
         var inst = new T();
         NetMessage.ReadObject(inst, typeof(T), reader);
         return inst;
+    }
+
+    public static byte[] WriteBytes(T obj)
+    {
+        if (obj is null) throw new ArgumentNullException(nameof(obj));
+        var writer = new NetMessageWriter();
+        Write(obj, writer);
+        return writer.GetBytes();
     }
 
     public static void Write(T obj, NetMessageWriter writer)
