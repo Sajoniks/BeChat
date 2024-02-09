@@ -85,7 +85,7 @@ public sealed class ConsolePrompt
         _x = Console.CursorLeft;
         _y = Console.CursorTop;
 
-        Console.CursorVisible = false;
+        ConsoleInterface.Instance.CursorVisible = false;
 
         if (_title is not null)
         {
@@ -141,7 +141,7 @@ public sealed class ConsolePrompt
 
         Console.CursorLeft = _x;
         Console.CursorTop= _y;
-        Console.CursorVisible = true;
+        ConsoleInterface.Instance.CursorVisible = true;
     }
 
     public string CopyString()

@@ -96,7 +96,9 @@ public class ConsoleSpinner : IDisposable
     public ConsoleSpinner(IConsoleSpinnerWidget widget)
     {
         _widget = widget ?? throw new ArgumentNullException(nameof(widget));
-        _visible = Console.CursorVisible;
+
+        _visible = ConsoleInterface.Instance.CursorVisible;
+        
         _currentH = Console.CursorTop;
         _currentW = Console.CursorLeft;
     }
@@ -118,12 +120,12 @@ public class ConsoleSpinner : IDisposable
         
         Console.CursorTop = prevH;
         Console.CursorLeft = prevW;
-        Console.CursorVisible = _visible;
+        ConsoleInterface.Instance.CursorVisible = _visible;
     }
     
     public void Spin()
     {
-        Console.CursorVisible = false;
+        ConsoleInterface.Instance.CursorVisible = false;
         
         int prevH = Console.CursorTop;
         int prevW = Console.CursorLeft;
@@ -164,7 +166,7 @@ public class ConsoleSpinner : IDisposable
         Console.CursorTop = prevH;
         Console.CursorLeft = prevW;
 
-        Console.CursorVisible = _visible;
+        ConsoleInterface.Instance.CursorVisible = _visible;
     }
 }
 

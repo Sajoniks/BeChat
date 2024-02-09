@@ -1,4 +1,7 @@
-﻿namespace BeChat.Logging.Loggers.FileLogger;
+﻿using System.Diagnostics;
+using System.Reflection;
+
+namespace BeChat.Logging.Loggers.FileLogger;
 
 internal sealed class StreamLogger : ILogger
 {
@@ -48,13 +51,17 @@ public sealed class FileLoggingFactory : ILoggerFactory
     public FileLoggingFactory(string fileName, ILogFormatter formatter)
     {
         _fileName = $"{fileName}_{DateTime.UtcNow:yy_MM_dd-hh_mm_ss.fff}.log";
-        string dir = Path.GetDirectoryName(_fileName) ?? throw new NullReferenceException();
-        if (!Directory.Exists(dir))
+
+        var baseDir = AppDomain.CurrentDomain.BaseDirectory;
+        var filePath = Path.Combine(baseDir, _fileName);
+        string basePath = Path.GetDirectoryName(filePath)!;
+            
+        if (!Directory.Exists(basePath))
         {
-            Directory.CreateDirectory(dir);
+            Directory.CreateDirectory(basePath);
         }
-        
-        var fileStream = new FileStream(_fileName, FileMode.Create, FileAccess.Write);
+
+        var fileStream = new FileStream(filePath, FileMode.Create, FileAccess.Write);
         _writer = new StreamWriter(fileStream);
         _formatter = formatter;
     }

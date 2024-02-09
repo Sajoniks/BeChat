@@ -418,7 +418,7 @@ public sealed class BeChatApplication : IApplication, IDisposable, IRelayMessage
             return new LoggerFactory(new ILoggerFactory[]
             {
                 new DebugLoggingFactory(logFormatter),
-                new FileLoggingFactory(@"logs\bechat", logFormatter)
+                new FileLoggingFactory(Path.Combine("logs", "bechat"), logFormatter)
             });
         });
         serviceCollection.AddSingleton<ILogger>(x =>

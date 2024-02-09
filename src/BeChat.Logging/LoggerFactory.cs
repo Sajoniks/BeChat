@@ -42,6 +42,23 @@ internal sealed class CompoundLogger : ILogger
     }
 }
 
+public class NullLogger : ILogger
+{
+    public static readonly NullLogger Instance = new();
+    
+    public void Dispose()
+    {
+    }
+
+    public void Log(LogLevel level, string message)
+    {
+    }
+
+    public void Log(LogLevel level, string format, params object?[] args)
+    {
+    }
+}
+
 public class LoggerFactory : ILoggerFactory
 {
     private readonly ILoggerFactory[] _factories;

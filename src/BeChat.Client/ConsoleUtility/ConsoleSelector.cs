@@ -130,7 +130,7 @@ public sealed class ConsoleSelector
 
             _isDrawn = true;
 
-            Console.CursorVisible = false;
+            ConsoleInterface.Instance.CursorVisible = false;
             if (Console.CursorLeft > 0)
             {
                 Console.WriteLine();
@@ -184,7 +184,7 @@ public sealed class ConsoleSelector
 
             _isDrawn = false;
 
-            Console.CursorVisible = true;
+            ConsoleInterface.Instance.CursorVisible = true;
             Console.CursorTop = _yBottom;
             Console.CursorLeft = _x;
             while (Console.CursorTop != _yTitle)
